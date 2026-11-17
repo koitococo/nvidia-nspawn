@@ -5,6 +5,7 @@ A PID-namespace child gives hooks a valid container-relative /proc view.
 """
 
 import ctypes
+import errno
 import json
 import os
 from pathlib import Path
@@ -128,10 +129,61 @@ def describe(path: str) -> dict:
     if result["exists"]:
         info = os.lstat(path)
         result.update(mode=info.st_mode, uid=info.st_uid, gid=info.st_gid,
-                      inode=info.st_ino, dev=info.st_dev, rdev=info.st_rdev)
+                      inode=info.st_ino, dev=info.st_dev, rdev=info.st_rdev,
+                      size=info.st_size, mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns)
         if stat.S_ISLNK(info.st_mode):
             result["link"] = os.readlink(path)
     return result
+
+
+def unchanged_path(saved: dict | None, actual: dict | None) -> bool:
+    if saved is None or actual is None:
+        return saved == actual
+    # Creating/removing children changes directory timestamps and size, not ownership.
+    ignored = {"size", "mtime_ns", "ctime_ns"} if stat.S_ISDIR(saved.get("mode", 0)) else set()
+    return ({k: v for k, v in saved.items() if k not in ignored}
+            == {k: v for k, v in actual.items() if k not in ignored})
+
+
+def recovery_paths(record: dict, current: dict) -> list[dict]:
+    """Select only unchanged owned resources in the same container rootfs."""
+    if any(record["root"][key] != current["root"][key] for key in ("dev", "inode")):
+        return []
+    by_path = {entry["path"]: entry for entry in current["paths"]}
+    result = []
+    for saved in record["paths"]:
+        actual = by_path[saved["path"]]
+        if not actual["exists"]:
+            continue
+        if not unchanged_path(saved, actual):
+            raise RuntimeError(f"Managed resource changed; refusing recovery: {saved['path']}")
+        resolved = actual["resolved"]
+        if any(m["target"] == resolved or m["target"].startswith(resolved.rstrip("/") + "/")
+               for m in current["mounts"]):
+            raise RuntimeError(f"Managed resource is mounted; refusing recovery: {saved['path']}")
+        result.append(actual)
+    return result
+
+
+def recover(record: dict) -> dict:
+    current = {"root": describe("/"), "paths": [describe(p["path"]) for p in record["paths"]],
+               "mounts": mount_table()}
+    # Check every resource before removing any; changed user files are never reclaimed.
+    entries = recovery_paths(record, current)
+    removed = []
+    for entry in sorted(entries, key=lambda p: p["path"].count("/"), reverse=True):
+        path = entry["path"]
+        if stat.S_ISDIR(entry["mode"]):
+            try:
+                os.rmdir(path)
+            except OSError as exc:
+                if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                    raise
+                continue
+        else:
+            os.unlink(path)
+        removed.append(path)
+    return {"removed": removed}
 
 
 def tracked_files() -> dict:
@@ -181,6 +233,7 @@ def cleanup(journal: dict) -> list:
 
 def apply(request: dict, fds: list[int]) -> dict:
     journal = {"mounted": [], "created": []}
+    placeholders = {}
     owner = request["owner"]
     try:
         for item, fd in zip(request["resources"], fds):
@@ -200,6 +253,7 @@ def apply(request: dict, fds: list[int]) -> dict:
                         pass
                 record_change(journal, "created", path)
                 os.chown(path, *owner)
+            placeholders[path] = describe(path)
             options = item.get("options", [])
             # Recursive security attributes were already set on the detached tree.
             # A /proc/self/fd path to a host mount cannot be bind-mounted from
@@ -234,7 +288,7 @@ def apply(request: dict, fds: list[int]) -> dict:
                 record_change(journal, "created", path)
                 stream.write("# Managed by nvidia-nspawn\n" + "\n".join(request["ldconfig_folders"]) + "\n")
             os.chown(path, *owner)
-        return {"journal": journal}
+        return {"journal": journal, "placeholders": placeholders}
     except Exception as exc:
         return {"error": str(exc), "journal": journal, "cleanup_errors": cleanup(journal)}
 
@@ -243,7 +297,8 @@ def dispatch(request: dict, fds: list[int]) -> dict:
     operation = request["operation"]
     if operation == "inspect":
         table = mount_table()
-        return {"mounts": table, "paths": [describe(p) for p in request["paths"]],
+        return {"root": describe("/"), "mounts": table,
+                "paths": [describe(p) for p in request["paths"]],
                 "tracked_files": tracked_files(),
                 "ldconfig": next((p for p in ("/sbin/ldconfig", "/usr/sbin/ldconfig")
                                   if os.access(p, os.X_OK)), None),
@@ -254,6 +309,8 @@ def dispatch(request: dict, fds: list[int]) -> dict:
         return apply(request, fds)
     if operation == "cleanup":
         return {"errors": cleanup(request["journal"])}
+    if operation == "recover":
+        return recover(request["record"])
     if operation == "hook":
         state = request["state"]
         state.update(root="/proc/1/root", pid=1,

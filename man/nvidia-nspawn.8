@@ -1,4 +1,4 @@
-.TH NVIDIA-NSPAWN 8 "2026-11-17" "nvidia-nspawn 0.1.1" "System Administration"
+.TH NVIDIA-NSPAWN 8 "2026-11-17" "nvidia-nspawn 0.1.2" "System Administration"
 .SH NAME
 nvidia\-nspawn \- inject NVIDIA GPUs into running systemd-nspawn containers
 .SH SYNOPSIS
@@ -37,6 +37,8 @@ Inspect the container, selected GPU, CDI edits, destination paths, user mappings
 and device policy; print the proposed attachment without applying it.
 Conflicting files, unsafe mount propagation, and unsupported CDI edits are
 rejected.
+After a restart, also preview recovery based on persistent ownership evidence.
+Do not remove resources or change records.
 .TP
 .B attach
 Apply the attachment to the current container instance.
@@ -44,6 +46,9 @@ Preserve existing device permissions and the container's own libc and loader.
 Repeated successful attachment of the same GPU to the same instance does not
 stack duplicate mounts.
 Replacing a GPU or overwriting a previous failed attachment is not supported.
+For a new instance after a container or host restart, validate persistent rootfs
+identity and resource fingerprints, reclaim only unchanged, unmounted resources
+created by the tool, then inject again.
 .TP
 .B status
 Report the recorded attachment phase and whether mounts, device nodes, and the
@@ -173,6 +178,12 @@ Host-side runtime record of container identity, GPU, resource fingerprints,
 change journal, and failure information.
 This is runtime state, not a persistent container configuration.
 .TP
+.I /var/lib/nvidia-nspawn/MACHINE.json
+Persistent rootfs identity and ownership descriptors for resources created by
+new attachments.
+Used to validate recovery in a new container instance; this does not persist
+mounts or GPU authorization.
+.TP
 .I /run/systemd/system.control/UNIT.d/50-DeviceAllow.conf
 Systemd-managed runtime device authorization on the host.
 It is not a persistent unit edit and may outlive a container restart.
@@ -181,14 +192,21 @@ It is not a persistent unit edit and may outlive a container restart.
 Managed driver library search directories inside the container.
 The container's own ldconfig updates its loader cache.
 .SH LIFECYCLE AND FAILURES
-Attachments are runtime-only and do not persist across container restarts.
+Runtime mounts and GPU authorization are not guaranteed to survive container
+or host restarts.
 Driver upgrades are not applied to existing attachments automatically.
-After a restart, inspect the new container instance and any remaining managed
-files before attaching again; stale files are not forcibly overwritten.
+After a restart, manually run plan and attach against the running container.
+Plan only previews recovery without modifying resources or records.
+Attach checks persistent rootfs identity and resource fingerprints before
+reclaiming unchanged, unmounted old tool resources and injecting again.
+Unknown files, modified resources, mismatched rootfs identity, or still-mounted
+resources cause cleanup to be refused.
+Neither NVIDIA filenames nor zero length establish ownership or safe removal.
+Residue from older versions without persistent ownership evidence is not
+automatically adopted or migrated; administrators must investigate it.
 .PP
-No ExecStartPost hook or boot-time automatic injection is installed.
-After each container start, the administrator must inspect remaining resources
-and invoke attach manually.
+The tool does not start containers or install ExecStartPost hooks or boot-time
+automatic injection.
 Runtime DeviceAllow settings are not a promise of revocation on container restart;
 they do not persist across a host reboot.
 .PP
@@ -213,11 +231,11 @@ Already running applications are not made to reload driver libraries.
 .PP
 Uninstalling the RPM is not GPU detachment or access revocation.
 It removes package-owned programs and documentation but leaves runtime records,
-device authorization, and injected container mounts, nodes, links, and loader
-configuration or cache in place.
+persistent ownership records, device authorization, and injected container
+mounts, nodes, links, and loader configuration or cache in place.
 Existing containers may continue using the GPU after uninstall.
 Administrators must separately plan access revocation and maintenance; deleting
-the state record alone does not revoke access.
+runtime or persistent ownership records alone does not revoke access.
 .SH SECURITY
 Run on the host, not inside the target container.
 The tool does not disable SELinux, change host device ownership or modes,

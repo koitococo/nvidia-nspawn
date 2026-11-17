@@ -6,7 +6,7 @@
 
 ## 当前验证状态
 
-已实现 `plan`、`attach`、`status`、`verify`，本地 **55 个测试通过**，并在 openSUSE Leap 16.0 和 Fedora 45 专用 GPU VM 上完成在线注入、普通用户 CUDA、重复注入和设备拒绝负向验收。
+已实现 `plan`、`attach`、`status`、`verify`，并在 openSUSE Leap 16.0 和 Fedora 45 专用 GPU VM 上完成在线注入、普通用户 CUDA、重复注入和设备拒绝负向验收。以下既有实机结果不代表重启后恢复能力已通过真实验收。
 
 Fedora 实测保留 SELinux enforcing 和 Secure Boot。标准 nspawn 模板的实际进程域为 `unconfined_service_t`；这不代表已验证自定义 `container_t` 等受限域。
 
@@ -75,7 +75,7 @@ sudo python3 -m nvidia_nspawn verify \
 
 ### plan
 
-只读盘点并生成计划，包括容器运行实例、cgroup、UID/GID 映射、设备节点、驱动文件、hooks 和设备授权。发现冲突文件、会向宿主机传播的共享挂载或无法解释的 CDI edit 时拒绝继续；nspawn 内部独立的 shared peer group 不作为宿主机传播风险。
+只读盘点并生成计划，包括容器运行实例、cgroup、UID/GID 映射、设备节点、驱动文件、hooks 和设备授权；重启后还预览基于持久归属记录的旧资源回收，不删除资源或修改记录。发现无法安全回收的冲突文件、会向宿主机传播的共享挂载或无法解释的 CDI edit 时拒绝继续；nspawn 内部独立的 shared peer group 不作为宿主机传播风险。
 
 不生成持久化 `.nspawn` 或 systemd drop-in。
 
@@ -87,6 +87,7 @@ sudo python3 -m nvidia_nspawn verify \
 - 适配 CDI 符号链接与动态链接器 hooks，配置使用 `/etc/ld.so.conf.d/nvidia-nspawn.conf`，执行容器自己的 `ldconfig`。
 - `createRuntime` hooks 在宿主机执行；其他支持的 `createContainer` hooks 通过预先打开的可执行文件描述符在目标挂载/PID 命名空间执行，提供 bundle、目标 root 和容器状态，不要求容器安装 Toolkit。支持 Toolkit 1.20.2 的内存限制 hook，但本项目不配置 GPU 内存配额，并显式拒绝相应配额环境变量。
 - 用 `/run/nvidia-nspawn/<machine>.json` 记录运行实例、资源指纹、变更 journal 和失败信息。
+- 另用 `/var/lib/nvidia-nspawn/<machine>.json` 持久保存 rootfs 身份和工具创建资源的归属描述，供新运行实例恢复使用；这不是持久化挂载或 GPU 授权。
 
 同一运行实例、同一 GPU 的成功注入可以重复执行，不叠加挂载。切换 GPU、失败后的残留状态和已有驱动冲突不自动覆盖。
 
@@ -107,9 +108,10 @@ sudo python3 -m nvidia_nspawn verify \
 ## 生命周期和失败处理
 
 - 不自动重启容器或重载宿主驱动。
-- 不配置 `ExecStartPost` 或开机自动注入，也不永久修改 nspawn unit。每次目标容器启动或重启后，管理员需先检查残留，再手工执行 `attach`；仅添加自动调用不能解决旧资源冲突。
+- 不配置 `ExecStartPost` 或开机自动注入，也不自动启动容器或永久修改 nspawn unit。容器或宿主机重启后，管理员需在容器已运行时手工执行 `plan` 和 `attach`。
 - `DeviceAllow` 通过 `runtime=true` 更新，systemd 在 `/run/systemd/system.control/` 下记录运行时 drop-in。容器重启不保证撤销这份授权；宿主机重启后该运行时配置不持久保留。
-- 运行时挂载不承诺跨容器重启存在，容器文件系统上的配置和占位文件可能保留。重启后先检查 `status` 与新计划；遇到旧的托管文件冲突，人工核实并清理后再注入，不强行覆盖。
+- 运行时挂载和 GPU 授权不承诺跨重启保留，容器文件系统上的配置和占位文件可能保留。新运行实例的 `attach` 根据持久归属记录验证 rootfs 身份与资源指纹，只回收仍未修改且未挂载的旧工具资源，再重新注入；`plan` 仅预览，不执行回收。
+- 未知文件、已修改资源、rootfs 身份不匹配或仍挂载的资源均拒绝清理，不凭 NVIDIA 文件名或零字节大小认定可删。旧版未留下持久归属证据的残留不自动认领或迁移，需管理员核实处理。
 - 驱动升级不做热更新，旧驱动版本记录会导致健康检查或验证失败。
 - 失败时尝试撤销本次创建的挂载、节点、配置和设备授权，保留失败 journal；不删除原先已有的用户文件。
 - 外部命令超时后，先终止并回收受监督的工作进程及后代，再开始失败清理；逐条记录已完成的挂载和文件变更。内核不可中断睡眠可能延长回收等待，超时不是保证立即返回。中断发生在文件操作与日志写入之间时，只报告无法确认的残留候选，不盲删既有资源，也不声称原子回滚。
@@ -119,9 +121,9 @@ sudo python3 -m nvidia_nspawn verify \
 
 ### 卸载 RPM 不等于撤销 GPU
 
-卸载只移除 RPM 拥有的 CLI、Python 模块、文档和 man page；不会自动 detach、撤销 `DeviceAllow` 或清理容器磁盘。运行中的 GPU 挂载、设备节点、符号链接、动态链接器配置/缓存、宿主机 `/run/nvidia-nspawn/` 记录及 systemd 运行时授权可能继续存在，容器仍能访问 GPU。
+卸载只移除 RPM 拥有的 CLI、Python 模块、文档和 man page；不会自动 detach、撤销 `DeviceAllow` 或清理容器磁盘。运行中的 GPU 挂载、设备节点、符号链接、动态链接器配置/缓存、宿主机 `/run/nvidia-nspawn/` 记录及 systemd 运行时授权可能继续存在，容器仍能访问 GPU；`/var/lib/nvidia-nspawn/` 的持久归属记录也保留。
 
-两版专用 VM 已实测卸载期间普通用户 CUDA 继续成功，重新安装后可继续检查状态。该行为避免打断正在运行的容器，但不能将卸载当作权限回收手段。当前没有自动清理或 detach 命令；需要回收访问权限时，管理员必须另行安排维护并核实容器和授权的实际状态，不能仅删除运行记录。
+两版专用 VM 已实测卸载期间普通用户 CUDA 继续成功，重新安装后可继续检查状态。该行为避免打断正在运行的容器，但不能将卸载当作权限回收手段。当前没有独立清理或 detach 命令；新运行实例的 `attach` 仅回收经验证的旧工具资源。需要回收访问权限时，管理员必须另行安排维护并核实容器和授权的实际状态，不能仅删除运行记录或持久归属记录。
 
 ## 专用 VM 验收清单
 
@@ -132,6 +134,7 @@ sudo python3 -m nvidia_nspawn verify \
 5. 执行 `verify`，保存普通用户 `nvidia-smi`、真实 CUDA 结果、动态加载证据和退出状态。
 6. 重复 `attach`，核对无重复挂载，再次 `verify`。
 7. 在隔离 fixture 中覆盖冲突资源、拒绝访问及部分失败清理；不在共享容器中制造故障。
+8. 分别重启容器和宿主机，在容器启动后重新执行 `plan`、`attach`、`verify`；确认持久归属记录跨主机重启保留，`plan` 不改资源或记录，重复注入不叠加挂载。
 
 ## 已完成的实机验收
 
@@ -153,6 +156,7 @@ sudo python3 -m nvidia_nspawn verify \
 - 测试期间的挂载/hook 失败覆盖了部分变更清理路径；发现并修复了 namespace 路径失效、跨 namespace bind 源和 D-Bus DeviceAllow 追加语义问题。
 - Fedora 验收另覆盖了 SELinux 文件标签与执行入口：补齐 rootfs 标签，并让 root 命令先通过 `setpriv` 进入目标域，保留 `ldconfig` 等程序的正常类型转换。失败后的设备授权、挂载和文件清理得到实测，未新增自定义 SELinux 策略。
 - 两版均验证 `PrivateUsers=no`：容器命令由 guest systemd 执行，其 capabilities／seccomp／SELinux 与正常容器服务一致，不具备 `CAP_SYS_TIME`；超时后整个服务及其子进程退出。临时 hook 挂载清理完成，普通用户 CUDA、重复注入和设备拒绝恢复均通过；原有 `-U` 容器验证仍成功。
+- 两版的独立 `-U` 与 `PrivateUsers=no` fixture 均通过容器重启、真实宿主机重启后的手工重新注入：持久归属记录跨重启保留，`plan` 不修改记录或占位文件，`attach` 后普通用户 `verify` 和独立 systemd 服务 `vectorAdd` 均通过，重复注入挂载数保持 95／89。Fedora 全程保持 SELinux enforcing；无用户映射 fixture 的 transient unit 使用与 nspawn 模板一致的 `KillMode=mixed`，Fedora 同时执行模板的停止后 cleanup。
 
 两台测试 VM 均保留 `nvidia-nspawn-test` 容器、Sample 和源码副本；原始证据位于测试用户的 `~/nvidia-nspawn-test/results/`。openSUSE 容器的测试组为 `nvidia-gpu`（485）和 `nvidia-render`（488）；Fedora 原生普通用户服务配置补充 GID 39（该 Ubuntu rootfs 中的组名为 `irc`），未修改持久用户组成员。
 
@@ -185,16 +189,16 @@ sudo zypper install rpm-build python-rpm-macros python3-devel \
 ```bash
 python3 -c 'from setuptools.build_meta import build_sdist; build_sdist("dist")'
 mkdir -p ~/rpmbuild/SOURCES
-cp dist/nvidia_nspawn-0.1.1.tar.gz ~/rpmbuild/SOURCES/
+cp dist/nvidia_nspawn-0.1.2.tar.gz ~/rpmbuild/SOURCES/
 rpmbuild -ba packaging/nvidia-nspawn.spec
 ```
 
 二进制包在 `~/rpmbuild/RPMS/noarch/`，源码 RPM 在 `~/rpmbuild/SRPMS/`。`%check` 对构建根目录中的 Python 包运行算法测试，不需要 GPU。
 
 ```bash
-# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.1-1.noarch.rpm
+# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.2-1.lp160.noarch.rpm
 # --nosignature 仅用于自己构建的未签名包，不跳过摘要或依赖检查
-sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.1-1.fc45.noarch.rpm
+sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.2-1.fc45.noarch.rpm
 nvidia-nspawn --help
 ```
 
@@ -240,11 +244,11 @@ sudo rpm -Uvh ./对应发行版的签名包.noarch.rpm
 
 内核需提供 `mount_setattr` 等接口（API 下限 Linux 5.12）、cgroup v2 和所需权限；安装某个版本的内核 RPM 不能保证当前启动内核满足要求。GPU 驱动分支由管理员按硬件选择，不固定为 P4 使用的 R580。
 
-宿主 RPM 不向容器安装软件；容器中的 `ldconfig`、`setpriv`、`id`、`readlink`、普通用户和验证用 CUDA Sample 仍需提前准备。不要将 Toolkit、驱动库、Sample、缓存或 `/run/nvidia-nspawn` 的运行状态打入项目 RPM。
+宿主 RPM 不向容器安装软件；容器中的 `ldconfig`、`setpriv`、`id`、`readlink`、普通用户和验证用 CUDA Sample 仍需提前准备。不要将 Toolkit、驱动库、Sample、缓存、`/run/nvidia-nspawn/` 的运行状态或 `/var/lib/nvidia-nspawn/` 的持久归属记录打入项目 RPM。
 
 ## GitHub Release 自动发布
 
-`.github/workflows/release.yml` 在推送 `v*` tag 时运行。正式发布 tag 必须是 `vX.Y.Z`，并且与 `pyproject.toml` 和 RPM spec 的 `Version` 完全一致；不匹配的 tag 会构建失败，不会发布。当前版本对应 `v0.1.1`。
+`.github/workflows/release.yml` 在推送 `v*` tag 时运行。正式发布 tag 必须是 `vX.Y.Z`，并且与 `pyproject.toml` 和 RPM spec 的 `Version` 完全一致；不匹配的 tag 会构建失败，不会发布。当前版本对应 `v0.1.2`。
 
 工作流在 Fedora 45、openSUSE Leap 16.0 的官方容器中分别安装原生构建依赖并执行 `packaging/build-rpm.sh`，运行 RPM `%check`。两版全部成功后，才使用仓库自带的 `GITHUB_TOKEN` 创建 Release 并上传：
 
@@ -260,8 +264,8 @@ sudo rpm -Uvh ./对应发行版的签名包.noarch.rpm
 发布前先提交并推送 workflow 和对应版本的源码，再创建、推送 tag，例如：
 
 ```bash
-git tag -a v0.1.1 -m "Release v0.1.1"
-git push origin v0.1.1
+git tag -a v0.1.2 -m "Release v0.1.2"
+git push origin v0.1.2
 ```
 
 不要把示例 tag 推到缺少 workflow 的旧提交。已有 tag 不会因为后来添加 workflow 自动补跑；已有 Release 也不会被自动覆盖。版本升级时同步更新 `pyproject.toml`、RPM spec 的版本和 man page 中的版本说明；同版本 RPM 修订的本地重建不等同于新的 `vX.Y.Z` 发布。
@@ -269,9 +273,9 @@ git push origin v0.1.1
 在匹配发行版上安装前述构建依赖后，也可运行同一构建脚本：
 
 ```bash
-TAG_NAME=v0.1.1 bash packaging/build-rpm.sh fedora45 dist/release
+TAG_NAME=v0.1.2 bash packaging/build-rpm.sh fedora45 dist/release
 # openSUSE Leap 16.0:
-TAG_NAME=v0.1.1 bash packaging/build-rpm.sh opensuse-leap16 dist/release
+TAG_NAME=v0.1.2 bash packaging/build-rpm.sh opensuse-leap16 dist/release
 ```
 
 ## 本地检查

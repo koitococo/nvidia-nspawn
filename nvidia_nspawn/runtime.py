@@ -11,9 +11,10 @@ import tempfile
 
 from . import cdi, host, native_execution
 from .common import Error, require_root, run
-from ._worker import mount_table, parent_mount
+from ._worker import mount_table, parent_mount, recovery_paths, unchanged_path
 
 STATE_DIR = Path("/run/nvidia-nspawn")
+RECOVERY_DIR = Path("/var/lib/nvidia-nspawn")
 WORKER = str(Path(__file__).with_name("_worker.py").resolve())
 MANAGED_CONF = "/etc/ld.so.conf.d/nvidia-nspawn.conf"
 PROFILE = "/etc/nvidia/nvidia-application-profiles-rc.d/10-container.conf"
@@ -56,7 +57,7 @@ def residual_candidates(before: dict, current: dict, paths: list[str]) -> list[d
          "new_mount": path in new_mounts,
          "reason": "Possible interrupted apply change; not automatically claimed for cleanup"}
         for path in paths if (path in new_mounts or now.get(path, {}).get("exists")
-                             and now.get(path) != old.get(path))]
+                             and not unchanged_path(old.get(path), now.get(path)))]
 
 
 def record_possible_residuals(state: dict, paths: list[str]) -> None:
@@ -169,6 +170,36 @@ def save_state(state: dict) -> None:
     state_path(state["target"]["machine"]).write_text(json.dumps(state, indent=2) + "\n")
 
 
+def recovery_path(machine: str) -> Path:
+    return RECOVERY_DIR / state_path(machine).name
+
+
+def save_recovery(state: dict) -> None:
+    """Persist ownership, including the hidden inodes underneath driver mounts."""
+    current = state["observed"]
+    by_path = {entry["path"]: entry for entry in current["paths"]}
+    by_path.update(current["tracked_files"])
+    by_path.update(state["placeholders"])
+    owned = [by_path[path] for path in state["journal"]["created"]
+             if path in by_path and by_path[path]["exists"]]
+    record = {"root": state["before"]["root"], "paths": owned}
+    RECOVERY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    recovery_path(state["target"]["machine"]).write_text(json.dumps(record, indent=2) + "\n")
+
+
+def plan_recovery(machine: str, target: dict) -> dict:
+    path = recovery_path(machine)
+    if not path.exists():
+        return {"paths": []}
+    record = json.loads(path.read_text())
+    current = inspect(target, [p["path"] for p in record["paths"]])
+    try:
+        paths = recovery_paths(record, current)
+    except RuntimeError as exc:
+        raise Error(str(exc)) from exc
+    return {"root": current["root"], "paths": paths}
+
+
 def mapped_id(mapping: str, value: int = 0) -> int:
     for line in mapping.splitlines():
         inside, outside, count = map(int, line.split())
@@ -234,21 +265,27 @@ def plan(machine: str, gpu: str) -> dict:
     previous = load_state(machine)
     same_instance = previous and all(previous["target"][k] == target[k]
                                      for k in ("boot_id", "leader", "starttime", "mount_ns"))
+    recovery = {"paths": []}
     if same_instance:
         if previous["gpu_uuid"] != gpu:
             raise Error("This container already has another GPU attachment; replacement is unsupported")
         if previous["phase"] != "attached":
             raise Error("Previous attach failed; inspect its reported residual changes before retrying")
     else:
-        validate_destinations(items, edits, observation)
+        recovery = plan_recovery(machine, target)
+        reclaimed = {entry["path"] for entry in recovery["paths"]}
+        validation = {**observation, "paths": [
+            {**entry, "exists": False} if entry["path"] in reclaimed else entry
+            for entry in observation["paths"]]}
+        validate_destinations(items, edits, validation)
     policy = host.device_policy(target["unit"])
     return {"target": target, "gpu_uuid": gpu, "driver_version": host.driver_version(),
             "plan": edits, "resources": items, "before": observation,
             "device_policy": policy,
             "requested_device_allow": host.merge_allow(policy["allow"], edits["devices"]),
             "owner": [mapped_id(target["uid_map"]), mapped_id(target["gid_map"])],
-            "existing_attachment": bool(same_instance),
-            "notes": ["Runtime only; container restart requires another attach.",
+            "existing_attachment": bool(same_instance), "recovery": recovery,
+            "notes": ["Runtime only; restart recovery reclaims only unchanged recorded resources.",
                       "Parent/descendant cgroup filters and SELinux are not bypassed; verify real device opens.",
                       "Device nodes are created with CDI mode and mapped ownership; host DAC is not modified."]}
 
@@ -326,7 +363,8 @@ def apply_hooks(state: dict, stage: str) -> None:
 
 
 def observe_changes(state: dict) -> None:
-    current = inspect(state["target"], [i["target"] for i in state["resources"]])
+    current = inspect(state["target"], [i["target"] for i in state["resources"]]
+                      + state["journal"]["created"])
     old_ids = {m["id"] for m in state["before"]["mounts"]}
     mounted = [m["target"] for m in current["mounts"] if m["id"] not in old_ids]
     # Scope hook cleanup to known NVIDIA paths; never claim unrelated new mounts.
@@ -350,13 +388,19 @@ def attach(machine: str, gpu: str) -> dict:
         if not current["healthy"]:
             raise Error("Existing attachment has drifted: " + json.dumps(current))
         return current
-    state = {**prepared, "phase": "applying", "journal": {"mounted": [], "created": []}}
+    state: dict = {**prepared, "phase": "applying", "journal": {"mounted": [], "created": []}}
     assert_identity(state["target"])
     if host.driver_version() != state["driver_version"]:
         raise Error("Host driver changed during planning; re-plan")
     for item in state["resources"]:
         if fingerprint(item["source"]) != item["fingerprint"]:
             raise Error(f"Host resource changed during planning: {item['source']}")
+    if state["recovery"]["paths"]:
+        worker(state["target"], "recover", record=state["recovery"])
+        state["before"] = inspect(state["target"], apply_paths(
+            state["resources"], state["plan"].get("links", []), True)
+            + [PROFILE, "/proc/driver/nvidia/params"])
+        validate_destinations(state["resources"], state["plan"], state["before"])
     save_state(state)
     policy_changed = False
     try:
@@ -376,6 +420,7 @@ def attach(machine: str, gpu: str) -> dict:
                 state["journal"] = result["journal"]
             raise Error(json.dumps(result))
         state["journal"] = result["journal"]
+        state["placeholders"] = result["placeholders"]
         save_state(state)
         apply_hooks(state, "createContainer")
         observe_changes(state)
@@ -387,6 +432,7 @@ def attach(machine: str, gpu: str) -> dict:
         result = status(machine)
         if not result["healthy"]:
             raise Error("Post-attach resources do not match: " + json.dumps(result))
+        save_recovery(state)
         return result
     except Exception as exc:
         cleanup_errors = []
