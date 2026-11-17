@@ -23,8 +23,110 @@ def assert_identity(target: dict) -> None:
     host.assert_identity(target)
 
 
+
+class WorkerError(Error):
+    """An incomplete apply with recovered progress and explicit uncertainty."""
+
+    def __init__(self, message: str, journal: dict, journal_errors: list[str],
+                 possible_residuals: list[str]):
+        super().__init__(message)
+        self.journal = journal
+        self.journal_errors = journal_errors
+        self.possible_residuals = possible_residuals
+
+
+def apply_paths(resources: list[dict], links: list[dict], managed_conf: bool) -> list[str]:
+    paths = {item["target"] for item in resources}
+    paths.update(link["link"] for link in links)
+    if managed_conf:
+        paths.add(MANAGED_CONF)
+    for path in tuple(paths):
+        paths.update(str(parent) for parent in Path(path).parents if str(parent) != "/")
+    return sorted(paths)
+
+
+def residual_candidates(before: dict, current: dict, paths: list[str]) -> list[dict]:
+    old = {entry["path"]: entry for entry in before["paths"]}
+    now = {entry["path"]: entry for entry in current["paths"]}
+    old_mounts = {entry["id"] for entry in before["mounts"]}
+    new_mounts = {entry["target"] for entry in current["mounts"]
+                  if entry["id"] not in old_mounts}
+    return [
+        {"path": path, "before": old.get(path), "current": now.get(path),
+         "new_mount": path in new_mounts,
+         "reason": "Possible interrupted apply change; not automatically claimed for cleanup"}
+        for path in paths if (path in new_mounts or now.get(path, {}).get("exists")
+                             and now.get(path) != old.get(path))]
+
+
+def record_possible_residuals(state: dict, paths: list[str]) -> None:
+    """Report unconfirmed paths; observation alone never authorizes their removal."""
+    before = {entry["path"]: entry for entry in state["before"]["paths"]}
+    state["possible_residuals"] = [
+        {"path": path, "before": before.get(path), "current": None,
+         "reason": "Apply interrupted; final observation unavailable"} for path in paths]
+    current = inspect(state["target"], paths)
+    state["possible_residuals"] = residual_candidates(state["before"], current, paths)
+
+
+def read_progress(data: bytes) -> tuple[dict, list[str]]:
+    journal = {"mounted": [], "created": []}
+    errors = []
+    for number, line in enumerate(data.splitlines(), 1):
+        try:
+            event = json.loads(line)
+            if (not isinstance(event, dict) or event.get("kind") not in journal
+                    or not isinstance(event.get("path"), str)
+                    or not event["path"].startswith("/")):
+                raise ValueError("invalid progress event")
+            journal[event["kind"]].append(event["path"])
+        except (ValueError, TypeError) as exc:
+            errors.append(f"Unconfirmed progress event {number}: {line!r}: {exc}")
+    if data and not data.endswith(b"\n"):
+        errors.append("Progress log ended without a complete newline-delimited record")
+    return journal, errors
+
+
+def apply_worker(target: dict, arguments: dict, *, timeout: int) -> str:
+    fd = os.memfd_create("nvidia-nspawn-apply", os.MFD_CLOEXEC)
+    try:
+        try:
+            output = run([sys.executable, WORKER], input=json.dumps({
+                "target": target, "operation": "apply", **arguments, "journal_fd": fd,
+            }), timeout=timeout, pass_fds=(fd,))
+            result = json.loads(output)
+            if (not isinstance(result, dict) or not isinstance(result.get("journal"), dict)
+                    or any(not isinstance(result["journal"].get(kind), list)
+                           or any(not isinstance(path, str) for path in result["journal"][kind])
+                           for kind in ("mounted", "created"))
+                    or ("error" in result and not isinstance(result.get("cleanup_errors"), list))):
+                raise ValueError("Worker returned an incomplete apply result")
+            # A complete error response has already attempted rollback. Replaying
+            # its append-only progress could remove a subsequently reused path.
+            return output
+        except (Error, ValueError, TypeError, KeyboardInterrupt) as exc:
+            # run only returns/raises once the entire command tree is reaped, so
+            # no writer can race this snapshot or keep changing the namespace.
+            try:
+                journal, errors = read_progress(os.pread(fd, os.fstat(fd).st_size, 0))
+            except OSError as progress_error:
+                journal = {"mounted": [], "created": []}
+                errors = [f"Cannot recover apply progress: {progress_error}"]
+            errors.append("Apply ended without a complete result; an in-flight change "
+                          "may not have reached the progress log. Inspect the target "
+                          "for unjournaled residual files or mounts.")
+            raise WorkerError(
+                str(exc) or type(exc).__name__, journal, errors,
+                apply_paths(arguments.get("resources", []), arguments.get("links", []),
+                            bool(arguments.get("ldconfig_folders")))) from exc
+    finally:
+        os.close(fd)
+
+
 def worker(target: dict, operation: str, *, timeout: int = 60, **kwargs) -> str:
     assert_identity(target)
+    if operation == "apply":
+        return apply_worker(target, kwargs, timeout=timeout)
     return run([sys.executable, WORKER], input=json.dumps({
         "target": target, "operation": operation, **kwargs,
     }), timeout=timeout)
@@ -110,8 +212,8 @@ def plan(machine: str, gpu: str) -> dict:
         for key, value in (("major", os.major(info.st_rdev)), ("minor", os.minor(info.st_rdev))):
             if key in device and device[key] != value:
                 raise Error(f"CDI {key} is stale for {device['source']}; regenerate CDI")
-    paths = [i["target"] for i in items] + [l["link"] for l in edits.get("links", [])]
-    paths += [MANAGED_CONF, PROFILE, "/proc/driver/nvidia/params"]
+    paths = apply_paths(items, edits.get("links", []), True)
+    paths += [PROFILE, "/proc/driver/nvidia/params"]
     observation = inspect(target, paths)
     previous = load_state(machine)
     same_instance = previous and all(previous["target"][k] == target[k]
@@ -263,11 +365,16 @@ def attach(machine: str, gpu: str) -> dict:
         return result
     except Exception as exc:
         cleanup_errors = []
+        if isinstance(exc, WorkerError):
+            state["journal"] = exc.journal
+            cleanup_errors.extend(exc.journal_errors)
         for action in (
-            lambda: observe_changes(state),
+            lambda: None if isinstance(exc, WorkerError) else observe_changes(state),
             lambda: cleanup_errors.extend(json.loads(worker(
                 state["target"], "cleanup", journal=state["journal"]))["errors"]),
             lambda: exec_container(state["target"], [state["before"]["ldconfig"]]),
+            lambda: record_possible_residuals(state, exc.possible_residuals)
+            if isinstance(exc, WorkerError) else None,
         ):
             try:
                 action()
@@ -283,6 +390,7 @@ def attach(machine: str, gpu: str) -> dict:
         save_state(state)
         raise Error(f"Attach failed: {exc}\nCleanup errors: {cleanup_errors}\n"
                     f"Change journal: {json.dumps(state['journal'])}\n"
+                    f"Possible residuals: {json.dumps(state.get('possible_residuals', []))}\n"
                     f"State: {state_path(machine)}") from exc
 
 

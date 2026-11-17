@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 
+from ._worker import validate_user_namespace
 from .common import Error, run
 
 
@@ -37,6 +38,12 @@ def discover(machine: str) -> dict:
               "root": f"/proc/{pid}/root", **process_identity(pid)}
     result["uid_map"] = Path(f"/proc/{pid}/uid_map").read_text()
     result["gid_map"] = Path(f"/proc/{pid}/gid_map").read_text()
+    try:
+        validate_user_namespace(
+            os.readlink("/proc/self/ns/user"), os.readlink(f"/proc/{pid}/ns/user"),
+            result["uid_map"], result["gid_map"])
+    except ValueError as exc:
+        raise Error(str(exc)) from exc
     result["selinux"] = (Path("/sys/fs/selinux/enforce").read_text().strip()
                          if Path("/sys/fs/selinux/enforce").exists() else "disabled")
     return result

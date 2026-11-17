@@ -124,6 +124,14 @@ user.
 For verification, prepare the CUDA Sample and its runtime dependencies in advance.
 A CUDA compiler and NVIDIA Container Toolkit are not required inside the
 container.
+.PP
+The container must use a separate user namespace, and neither its UID nor GID
+mapping may include host ID 0.
+The standard nspawn
+.B \-U
+configuration meets this requirement.
+Targets sharing the caller's user namespace or mapping host root are rejected
+before attachment changes.
 .SH EXAMPLES
 List host GPU UUIDs:
 .PP
@@ -157,6 +165,10 @@ Host-side runtime record of container identity, GPU, resource fingerprints,
 change journal, and failure information.
 This is runtime state, not a persistent container configuration.
 .TP
+.I /run/systemd/system.control/UNIT.d/50-DeviceAllow.conf
+Systemd-managed runtime device authorization on the host.
+It is not a persistent unit edit and may outlive a container restart.
+.TP
 .I /etc/ld.so.conf.d/nvidia-nspawn.conf
 Managed driver library search directories inside the container.
 The container's own ldconfig updates its loader cache.
@@ -166,6 +178,12 @@ Driver upgrades are not applied to existing attachments automatically.
 After a restart, inspect the new container instance and any remaining managed
 files before attaching again; stale files are not forcibly overwritten.
 .PP
+No ExecStartPost hook or boot-time automatic injection is installed.
+After each container start, the administrator must inspect remaining resources
+and invoke attach manually.
+Runtime DeviceAllow settings are not a promise of revocation on container restart;
+they do not persist across a host reboot.
+.PP
 On attachment failure the tool attempts to undo new mounts, files, device nodes,
 and device permission changes.
 Cleanup failures and residual changes are reported rather than hidden.
@@ -173,13 +191,33 @@ Inspect the failure record before retrying.
 Do not blindly delete recorded paths: some refer to container resources, and
 existing user files must be preserved.
 .PP
+On timeout, supervised workers and their descendants are terminated and reaped
+before rollback starts.
+Waiting for an uninterruptible kernel operation may extend cleanup beyond the
+command timeout; the timeout is not a guarantee of immediate return.
+Completed changes are recorded incrementally.
+An interruption between a filesystem operation and its progress record cannot
+be treated as an atomic transaction; uncertain residual candidates are reported
+without blindly deleting pre-existing resources.
+.PP
 No live GPU detach command or GPU memory quota configuration is provided.
 Already running applications are not made to reload driver libraries.
+.PP
+Uninstalling the RPM is not GPU detachment or access revocation.
+It removes package-owned programs and documentation but leaves runtime records,
+device authorization, and injected container mounts, nodes, links, and loader
+configuration or cache in place.
+Existing containers may continue using the GPU after uninstall.
+Administrators must separately plan access revocation and maintenance; deleting
+the state record alone does not revoke access.
 .SH SECURITY
 Run on the host, not inside the target container.
 The tool does not disable SELinux, change host device ownership or modes,
 modify Secure Boot, reload drivers, or restart containers.
 It does not bypass parent cgroup restrictions or SELinux policy.
+.PP
+Host mounts are made private and read-only, including recursive restrictions for
+rbind trees, while still detached and before becoming visible to the container.
 .PP
 Ensure that imported container root filesystems have appropriate SELinux file
 labels.

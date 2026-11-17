@@ -6,7 +6,7 @@
 
 ## 当前验证状态
 
-已实现 `plan`、`attach`、`status`、`verify`，本地 **35 个算法测试通过**，并在 openSUSE Leap 16.0 和 Fedora 45 专用 GPU VM 上完成在线注入、普通用户 CUDA、重复注入和设备拒绝负向验收。
+已实现 `plan`、`attach`、`status`、`verify`，本地 **52 个测试通过**，并在 openSUSE Leap 16.0 和 Fedora 45 专用 GPU VM 上完成在线注入、普通用户 CUDA、重复注入和设备拒绝负向验收。
 
 Fedora 实测保留 SELinux enforcing 和 Secure Boot。标准 nspawn 模板的实际进程域为 `unconfined_service_t`；这不代表已验证自定义 `container_t` 等受限域。
 
@@ -22,6 +22,8 @@ Fedora 实测保留 SELinux enforcing 和 Secure Boot。标准 nspawn 模板的�
 - 以宿主机 root 执行，而非在目标容器里执行。
 
 容器：
+
+- 必须有独立用户命名空间，且 UID/GID 映射均不得包含宿主机 ID 0；标准 nspawn `-U` 配置符合此要求。共享宿主用户命名空间、关闭用户映射或映射宿主 root 的目标在变更前被拒绝。
 
 - 容器中有 `ldconfig`、`setpriv`、`id`、`readlink`，以及已有普通用户。
 - 尚未安装或注入冲突的 NVIDIA 驱动文件。
@@ -79,7 +81,7 @@ sudo python3 -m nvidia_nspawn verify \
 
 ### attach
 
-- 使用 `open_tree` 在宿主机克隆 detached mount，再用 `move_mount` 注入目标现有挂载命名空间；支持 CDI `rbind`，递归设置只读等属性，保留容器自身 glibc 和动态链接器。
+- 使用 `open_tree` 在宿主机克隆 detached mount，在公开之前设置 private、只读及 CDI 要求的安全属性，再用 `move_mount` 注入目标现有挂载命名空间；`rbind` 的子挂载递归设置限制，保留容器自身 glibc 和动态链接器。
 - 在容器文件系统中创建设备节点，使用 CDI 指定的权限和经 UID/GID 映射的所有者，不修改宿主机设备 chmod/ACL。
 - 通过 systemd D-Bus 运行时更新 `DeviceAllow`，保留既有规则。非空数组在该接口中是追加语义，因此在同一请求内先清空再设置完整合并列表，确保失败回滚也能撤销新增许可。若 `DevicePolicy=auto` 且允许列表为空，不添加首条规则而意外收紧策略。
 - 适配 CDI 符号链接与动态链接器 hooks，配置使用 `/etc/ld.so.conf.d/nvidia-nspawn.conf`，执行容器自己的 `ldconfig`。
@@ -105,12 +107,21 @@ sudo python3 -m nvidia_nspawn verify \
 ## 生命周期和失败处理
 
 - 不自动重启容器或重载宿主驱动。
+- 不配置 `ExecStartPost` 或开机自动注入，也不永久修改 nspawn unit。每次目标容器启动或重启后，管理员需先检查残留，再手工执行 `attach`；仅添加自动调用不能解决旧资源冲突。
+- `DeviceAllow` 通过 `runtime=true` 更新，systemd 在 `/run/systemd/system.control/` 下记录运行时 drop-in。容器重启不保证撤销这份授权；宿主机重启后该运行时配置不持久保留。
 - 运行时挂载不承诺跨容器重启存在，容器文件系统上的配置和占位文件可能保留。重启后先检查 `status` 与新计划；遇到旧的托管文件冲突，人工核实并清理后再注入，不强行覆盖。
 - 驱动升级不做热更新，旧驱动版本记录会导致健康检查或验证失败。
 - 失败时尝试撤销本次创建的挂载、节点、配置和设备授权，保留失败 journal；不删除原先已有的用户文件。
+- 外部命令超时后，先终止并回收受监督的工作进程及后代，再开始失败清理；逐条记录已完成的挂载和文件变更。内核不可中断睡眠可能延长回收等待，超时不是保证立即返回。中断发生在文件操作与日志写入之间时，只报告无法确认的残留候选，不盲删既有资源，也不声称原子回滚。
 - 若清理失败、容器实例变化或挂载仍在使用，返回原始错误及残留信息，不假称已回滚。
 - `ldconfig` 更新的缓存属于派生数据，回滚后重新运行；不把缓存内容逐字恢复作为契约。
 - 不提供运行中 GPU 卸载命令，也不承诺让已经加载库的进程自动切换驱动。
+
+### 卸载 RPM 不等于撤销 GPU
+
+卸载只移除 RPM 拥有的 CLI、Python 模块、文档和 man page；不会自动 detach、撤销 `DeviceAllow` 或清理容器磁盘。运行中的 GPU 挂载、设备节点、符号链接、动态链接器配置/缓存、宿主机 `/run/nvidia-nspawn/` 记录及 systemd 运行时授权可能继续存在，容器仍能访问 GPU。
+
+两版专用 VM 已实测卸载期间普通用户 CUDA 继续成功，重新安装后可继续检查状态。该行为避免打断正在运行的容器，但不能将卸载当作权限回收手段。当前没有自动清理或 detach 命令；需要回收访问权限时，管理员必须另行安排维护并核实容器和授权的实际状态，不能仅删除运行记录。
 
 ## 专用 VM 验收清单
 
@@ -180,9 +191,9 @@ rpmbuild -ba packaging/nvidia-nspawn.spec
 二进制包在 `~/rpmbuild/RPMS/noarch/`，源码 RPM 在 `~/rpmbuild/SRPMS/`。`%check` 对构建根目录中的 Python 包运行算法测试，不需要 GPU。
 
 ```bash
-# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.0-3.noarch.rpm
+# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.0-4.noarch.rpm
 # --nosignature 仅用于自己构建的未签名包，不跳过摘要或依赖检查
-sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.0-3.fc45.noarch.rpm
+sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.0-4.fc45.noarch.rpm
 nvidia-nspawn --help
 ```
 
@@ -211,4 +222,4 @@ nvidia-nspawn --help
 python3 -m unittest discover -s tests -v
 ```
 
-单元测试只约束本项目的 CDI 合并、资源冲突、权限合并、用户映射、挂载路径解析与 GPU 输出证据解析，不模拟 GPU 成功、不作为 VM 验收替代。
+测试覆盖本项目的 CDI 合并、资源冲突、权限合并、用户映射、挂载路径解析、GPU 输出证据及进度恢复算法，并以真实本地 fork/超时验证后代进程回收。不模拟 GPU 成功、不作为 VM 验收替代。

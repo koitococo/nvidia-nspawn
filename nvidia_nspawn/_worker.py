@@ -18,6 +18,36 @@ LIBC.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
 LIBC.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
 LIBC.setns.argtypes = [ctypes.c_int, ctypes.c_int]
 
+JOURNAL_FD = None
+
+
+def validate_user_namespace(own_namespace: str, target_namespace: str,
+                            uid_map: str, gid_map: str) -> None:
+    if own_namespace == target_namespace:
+        raise ValueError("A separate user namespace with non-root host mappings is required")
+    for name, mapping in (("UID", uid_map), ("GID", gid_map)):
+        root_mapped = False
+        for row in mapping.splitlines():
+            inside, outside, count = map(int, row.split())
+            if inside < 0 or outside < 0 or count <= 0:
+                raise ValueError(f"Invalid {name} mapping")
+            if outside == 0:
+                raise ValueError(f"Refusing a {name} mapping that includes host root")
+            root_mapped |= inside == 0
+        if not root_mapped:
+            raise ValueError(f"Container root has no {name} mapping")
+
+
+def record_change(journal: dict, kind: str, path: str) -> None:
+    journal[kind].append(path)
+    if JOURNAL_FD is not None:
+        data = (json.dumps({"kind": kind, "path": path}) + "\n").encode()
+        while data:
+            written = os.write(JOURNAL_FD, data)
+            if written == 0:
+                raise OSError("Unable to record namespace change")
+            data = data[written:]
+
 
 def syscall(result: int, action: str) -> None:
     if result != 0:
@@ -40,6 +70,11 @@ def clone_source(item: dict) -> int:
     fd = LIBC.open_tree(-100, os.fsencode(item["source"]), flags)
     if fd < 0:
         syscall(-1, f"clone mount source {item['source']}")
+    try:
+        detached_attributes(fd, item.get("options", []))
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -48,16 +83,21 @@ class MountAttributes(ctypes.Structure):
                 ("attr_set", "attr_clr", "propagation", "userns_fd")]
 
 
-def recursive_attributes(path: str, options: list[str]) -> None:
-    attributes = MountAttributes()
-    for name, flag in (("ro", 1), ("nosuid", 2), ("nodev", 4), ("noexec", 8)):
+def detached_attributes(fd: int, options: list[str]) -> None:
+    # Never expose a writable host inode, even briefly. These attributes are
+    # applied to the detached tree before entering the target mount namespace.
+    attributes = MountAttributes(attr_set=1, propagation=1 << 18)  # RDONLY, PRIVATE
+    for name, flag in (("nosuid", 2), ("nodev", 4), ("noexec", 8)):
         if name in options:
             attributes.attr_set |= flag
+    flags = 0x1000  # AT_EMPTY_PATH
+    if "rbind" in options:
+        flags |= 0x8000  # AT_RECURSIVE
     LIBC.mount_setattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
                                   ctypes.POINTER(MountAttributes), ctypes.c_size_t]
-    syscall(LIBC.mount_setattr(-100, os.fsencode(path), 0x8000,
+    syscall(LIBC.mount_setattr(fd, b"", flags,
                               ctypes.byref(attributes), ctypes.sizeof(attributes)),
-            f"set recursive mount attributes on {path}")
+            "secure detached host mount")
 
 
 def decode_mount_path(path: str) -> str:
@@ -115,7 +155,7 @@ def make_parents(path: str, journal: dict, owner: list) -> None:
         parent = os.path.dirname(parent)
     for directory in reversed(missing):
         os.mkdir(directory, 0o755)
-        journal["created"].append(directory)
+        record_change(journal, "created", directory)
         os.chown(directory, *owner)
 
 
@@ -148,7 +188,7 @@ def apply(request: dict, fds: list[int]) -> dict:
             make_parents(path, journal, owner)
             if item.get("device"):
                 os.mknod(path, stat.S_IFCHR | item["node_mode"], item["rdev"])
-                journal["created"].append(path)
+                record_change(journal, "created", path)
                 os.chown(path, *item["node_owner"])
                 os.chmod(path, item["node_mode"])
                 continue
@@ -158,19 +198,18 @@ def apply(request: dict, fds: list[int]) -> dict:
                 else:
                     with open(path, "xb"):
                         pass
-                journal["created"].append(path)
+                record_change(journal, "created", path)
                 os.chown(path, *owner)
             options = item.get("options", [])
-            recursive = "rbind" in options
+            # Recursive security attributes were already set on the detached tree.
             # A /proc/self/fd path to a host mount cannot be bind-mounted from
             # another mount namespace. Transfer a detached host mount instead.
             LIBC.move_mount.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
                                        ctypes.c_char_p, ctypes.c_uint]
             syscall(LIBC.move_mount(fd, b"", -100, os.fsencode(path), 4),
                     f"attach detached host mount to {path}")
-            journal["mounted"].append(path)
-            mount("", path, (1 << 18) | (16384 if "rprivate" in options else 0))
-            flags = 4096 | 32  # MS_BIND | MS_REMOUNT
+            record_change(journal, "mounted", path)
+            flags = 4096 | 32 | 1  # MS_BIND | MS_REMOUNT | MS_RDONLY
             for option, bit in (("ro", 1), ("nosuid", 2), ("nodev", 4), ("noexec", 8),
                                 ("sync", 16), ("dirsync", 128), ("noatime", 1024),
                                 ("nodiratime", 2048), ("relatime", 1 << 21),
@@ -178,8 +217,6 @@ def apply(request: dict, fds: list[int]) -> dict:
                 if option in options:
                     flags |= bit
             mount("", path, flags)
-            if recursive:
-                recursive_attributes(path, options)
         for link in request["links"]:
             path = link["link"]
             if os.path.islink(path) and os.readlink(path) == link["target"]:
@@ -188,13 +225,13 @@ def apply(request: dict, fds: list[int]) -> dict:
                 raise RuntimeError(f"Refusing to replace existing symlink/file: {path}")
             make_parents(path, journal, owner)
             os.symlink(link["target"], path)
-            journal["created"].append(path)
+            record_change(journal, "created", path)
             os.chown(path, *owner, follow_symlinks=False)
         if request["ldconfig_folders"]:
             path = "/etc/ld.so.conf.d/nvidia-nspawn.conf"
             make_parents(path, journal, owner)
             with open(path, "x") as stream:
-                journal["created"].append(path)
+                record_change(journal, "created", path)
                 stream.write("# Managed by nvidia-nspawn\n" + "\n".join(request["ldconfig_folders"]) + "\n")
             os.chown(path, *owner)
         return {"journal": journal}
@@ -259,8 +296,17 @@ def dispatch(request: dict, fds: list[int]) -> dict:
 
 
 def main() -> None:
+    global JOURNAL_FD
     request = json.load(sys.stdin)
     pid = request["target"]["leader"]
+    own_namespace = os.readlink("/proc/self/ns/user")
+    target_namespace = os.readlink(f"/proc/{pid}/ns/user")
+    validate_user_namespace(own_namespace, target_namespace,
+                            Path(f"/proc/{pid}/uid_map").read_text(),
+                            Path(f"/proc/{pid}/gid_map").read_text())
+    if request["operation"] == "apply" and "journal_fd" in request:
+        JOURNAL_FD = request["journal_fd"]
+        os.set_inheritable(JOURNAL_FD, False)
     # Acquire all host handles before changing namespaces or root.
     fds = [clone_source(item) for item in request.get("resources", [])]
     if request["operation"] == "hook":
@@ -270,9 +316,7 @@ def main() -> None:
     root = os.open(f"/proc/{pid}/root", os.O_RDONLY | os.O_DIRECTORY)
     mount_ns = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY)
     pid_ns = os.open(f"/proc/{pid}/ns/pid", os.O_RDONLY)
-    user_ns = None
-    if os.readlink(f"/proc/{pid}/ns/user") != os.readlink("/proc/self/ns/user"):
-        user_ns = os.open(f"/proc/{pid}/ns/user", os.O_RDONLY)
+    user_ns = os.open(f"/proc/{pid}/ns/user", os.O_RDONLY)
     if request["operation"] == "exec":
         # Verification must exercise the container's device BPF policy, not
         # silently inherit the host CLI's unrestricted cgroup.
@@ -289,7 +333,7 @@ def main() -> None:
             os.close(fd)
     syscall(LIBC.setns(mount_ns, 0), "enter mount namespace")
     syscall(LIBC.setns(pid_ns, 0), "enter PID namespace")
-    if request["operation"] == "exec" and user_ns is not None:
+    if request["operation"] == "exec":
         syscall(LIBC.setns(user_ns, 0), "enter user namespace")
         os.setgroups([])
         os.setresgid(0, 0, 0)
