@@ -142,6 +142,67 @@ sudo python3 -m nvidia_nspawn verify \
 
 两台测试 VM 均保留 `nvidia-nspawn-test` 容器、Sample 和源码副本；原始证据位于测试用户的 `~/nvidia-nspawn-test/results/`。openSUSE 容器的测试组为 `nvidia-gpu`（485）和 `nvidia-render`（488）；Fedora 原生普通用户服务配置补充 GID 39（该 Ubuntu rootfs 中的组名为 `irc`），未修改持久用户组成员。
 
+## RPM 打包
+
+采用 [MIT 许可证](LICENSE)。`packaging/nvidia-nspawn.spec` 共用源码，在 Fedora 45 和 openSUSE Leap 16.0 上分别构建 `noarch` RPM；Python ABI 和系统依赖仍由各发行版处理，不能混装两版产物。
+
+### 构建依赖
+
+Fedora：
+
+```bash
+sudo dnf install rpm-build python3-devel pyproject-rpm-macros \
+  python3-pip python3-setuptools python3-wheel
+```
+
+openSUSE Leap 16.0（默认 Python 3.13）：
+
+```bash
+sudo zypper install rpm-build python-rpm-macros python3-devel \
+  python313-pip python313-setuptools python313-wheel
+```
+
+构建后端要求 `setuptools >= 77`，用于 SPDX `MIT` 和许可证文件元数据；这是构建依赖，不是运行依赖。RPM 的 wheel 构建禁用联网依赖解析，使用预先安装的发行版依赖。
+
+### 构建与安装
+
+在目标发行版的源码目录执行：
+
+```bash
+python3 -c 'from setuptools.build_meta import build_sdist; build_sdist("dist")'
+mkdir -p ~/rpmbuild/SOURCES
+cp dist/nvidia_nspawn-0.1.0.tar.gz ~/rpmbuild/SOURCES/
+rpmbuild -ba packaging/nvidia-nspawn.spec
+```
+
+二进制包在 `~/rpmbuild/RPMS/noarch/`，源码 RPM 在 `~/rpmbuild/SRPMS/`。`%check` 对构建根目录中的 Python 包运行算法测试，不需要 GPU。
+
+```bash
+# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.0-2.noarch.rpm
+# --nosignature 仅用于自己构建的未签名包，不跳过摘要或依赖检查
+sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.0-2.fc45.noarch.rpm
+nvidia-nspawn --help
+```
+
+本地构建产物默认未签名；正式分发前应签名并正常验证。Fedora 的 RPM 6 默认拒绝未签名包，上面的参数只作用于本次安装，不修改全局校验策略。RPM 不包含安装/卸载脚本，不会安装或切换驱动、登记 MOK、重启容器或修改 SELinux 策略。安装前仍须准备可用的 NVIDIA 驱动、NVML、libcuda 和 `nvidia-smi`，并配置能提供 `nvidia-container-toolkit-base >= 1.20.2` 的可信仓库。
+
+实际入口安装在发行版的 `%{_libexecdir}/nvidia-nspawn/cli`，`/usr/bin/nvidia-nspawn` 是指向它的符号链接。这样沿用标准 SELinux 文件标签，避免 Fedora 将普通 `/usr/bin/nvidia.*` 文件误归为 X server 入口，不需要额外放行策略。
+
+### 运行依赖与边界
+
+| 依赖 | Fedora | openSUSE Leap |
+|---|---|---|
+| Python ≥ 3.11 | `python3` | `python3-base` |
+| 容器与 D-Bus CLI | `systemd`、`systemd-container` | 同左 |
+| 系统总线 | `dbus` | `dbus-1` |
+| libc 挂载接口 | `glibc >= 2.36` | 同左 |
+| SELinux 动态库 | `libselinux` | `libselinux1` |
+| CDI 生成与 hooks | `nvidia-container-toolkit-base >= 1.20.2` | 同左 |
+
+内核需提供 `mount_setattr` 等接口（API 下限 Linux 5.12）、cgroup v2 和所需权限；安装某个版本的内核 RPM 不能保证当前启动内核满足要求。GPU 驱动分支由管理员按硬件选择，不固定为 P4 使用的 R580。
+
+宿主 RPM 不向容器安装软件；容器中的 `ldconfig`、`setpriv`、`id`、`readlink`、普通用户和验证用 CUDA Sample 仍需提前准备。不要将 Toolkit、驱动库、Sample、缓存或 `/run/nvidia-nspawn` 的运行状态打入项目 RPM。
+
 ## 本地检查
 
 ```bash
