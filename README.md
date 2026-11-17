@@ -6,9 +6,9 @@
 
 ## 当前验证状态
 
-已实现 `plan`、`attach`、`status`、`verify`，本地 **35 个算法测试通过**，并完成专用 GPU VM 的在线注入、普通用户 CUDA、重复注入和设备拒绝负向验收。
+已实现 `plan`、`attach`、`status`、`verify`，本地 **35 个算法测试通过**，并在 openSUSE Leap 16.0 和 Fedora 45 专用 GPU VM 上完成在线注入、普通用户 CUDA、重复注入和设备拒绝负向验收。
 
-本次实测宿主机是 **openSUSE Leap 16.0，不是 Fedora**；SELinux 原有状态为 permissive，未修改。Fedora 45 / SELinux enforcing 尚待独立验收。
+Fedora 实测保留 SELinux enforcing 和 Secure Boot。标准 nspawn 模板的实际进程域为 `unconfined_service_t`；这不代表已验证自定义 `container_t` 等受限域。
 
 ## 前提
 
@@ -29,6 +29,17 @@
 - CUDA 编译器无需长期留在容器中。`nvidia-smi` 的 CUDA version 字段不代表已安装 CUDA Toolkit。
 
 首次验收建议使用只有一张可见 GPU 的专用 VM 和可丢弃容器，保留实际 SELinux、用户命名空间配置，不通过关闭隔离来制造成功。
+
+### Fedora SELinux 根目录标签
+
+从 tar 自行展开的容器根目录可能继承 `var_lib_t`，不能直接作为 SELinux 域转换的可执行入口。应在注入前对独立 rootfs 补齐标准文件标签，例如：
+
+```bash
+root=/var/lib/machines/gpu-test
+sudo setfiles -r "$root" /etc/selinux/targeted/contexts/files/file_contexts "$root"
+```
+
+这里只重标记容器的磁盘目录，不新增 SELinux 放行策略。不要对已经包含宿主机绑定挂载的 `/proc/LEADER/root` 递归重标记，以免修改宿主机驱动文件的标签。
 
 ## 使用
 
@@ -85,7 +96,7 @@ sudo python3 -m nvidia_nspawn verify \
 4. 用 glibc `LD_DEBUG=libs` 的实际初始化记录和容器路径解析，核对 NVML/libcuda 来自注入的驱动，而不是仅检查 `ldd` 或库搜索候选。
 5. 前后核对容器运行实例及宿主机驱动。
 
-验证子进程进入目标 cgroup 和 namespaces，并在启用 SELinux 时设置目标执行标签，避免宿主机权限绕过造成假阳性。CDI 环境变量及 `additionalGids` 只应用于工具启动的验证进程，不修改现有 shell、用户的持久组成员或宿主机设备权限。正常使用 `nvidia-smi` 不依赖临时 `LD_LIBRARY_PATH`；从其他入口启动应用时，管理员仍需为该用户或服务配置对应 GPU 组。
+验证子进程进入目标 cgroup 和 namespaces，并在启用 SELinux 时通过容器自己的 `setpriv` 入口进入目标域，再允许程序正常发生 SELinux 类型转换，避免宿主机权限绕过或强制载荷入口域造成错误。CDI 环境变量及 `additionalGids` 只应用于工具启动的验证进程，不修改现有 shell、用户的持久组成员或宿主机设备权限。正常使用 `nvidia-smi` 不依赖临时 `LD_LIBRARY_PATH`；从其他入口启动应用时，管理员仍需为该用户或服务配置对应 GPU 组。
 
 支持已核实的 `vectorAdd` 输出契约，包括历史版本的 `Test PASSED` 和新版统一内存示例的结果匹配标记。源码版本、构建 CUDA 版本、架构参数需由 Sample 提供者另行记录；输出标记不能证明任意二进制的来源。
 
@@ -111,14 +122,14 @@ sudo python3 -m nvidia_nspawn verify \
 
 ## 已完成的实机验收
 
-| 项目 | 实测环境 |
-|---|---|
-| 宿主机 | openSUSE Leap 16.0，kernel 6.12.0-160000.40-default，systemd 257.13 |
-| GPU / 驱动 | Tesla P4 / 580.196.07 |
-| NVIDIA Container Toolkit | 1.20.2 |
-| 容器 | Ubuntu Base 24.04.5，标准 `systemd-nspawn@` 模板，`DevicePolicy=closed`，启用 `-U` 用户映射 |
-| CUDA / Sample | nvcc 12.6.85，`sm_61`；CUDA Samples v12.8，提交 `db3eea23946bca2e90a75eca2b5b3e07158a9e11` |
-| 安全状态 | SELinux permissive，未关闭用户命名空间、未扩大宿主机设备 DAC |
+| 项目 | openSUSE VM | Fedora VM |
+|---|---|---|
+| 宿主机 | Leap 16.0，kernel 6.12.0-160000.40-default，systemd 257.13 | Fedora 45，kernel 7.3.3-300.fc45.x86_64，systemd 262.1 |
+| GPU / 驱动 | Tesla P4 / 580.196.07 | Tesla P4 / RPM Fusion 580xx 580.196.07 |
+| NVIDIA Container Toolkit | 1.20.2 | 1.20.2 |
+| 容器 | Ubuntu Base 24.04.5，标准 `systemd-nspawn@` 模板，`DevicePolicy=closed`，启用 `-U` 用户映射 | 相同配置 |
+| CUDA / Sample | nvcc 12.6.85，`sm_61`；CUDA Samples v12.8，提交 `db3eea23946bca2e90a75eca2b5b3e07158a9e11` | 复用同一已校验二进制，未安装编译器 |
+| 安全状态 | SELinux permissive | SELinux enforcing；本机签名模块经 MOK 登记，Secure Boot 保持开启 |
 
 - 注入前，普通用户没有 NVIDIA 设备和 `nvidia-smi`，真实 `vectorAdd` 失败。
 - 注入后，UID 1000 的普通用户查询到选定 GPU；`vectorAdd` 执行 50,000 元素向量加法并报告 `Test PASSED`，成功退出。
@@ -127,8 +138,9 @@ sudo python3 -m nvidia_nspawn verify \
 - 从目标宿主机 unit 撤销 GPU `DeviceAllow` 后，同一验证入口在 `nvidia-smi` 阶段因 NVML 初始化失败而被拒绝；恢复后再次完整验证通过。
 - 不依赖项目执行工作器，使用容器自己的 systemd 启动普通用户服务，配置对应补充组后，`nvidia-smi` 和 `vectorAdd` 同样成功；未设置 `LD_LIBRARY_PATH`。
 - 测试期间的挂载/hook 失败覆盖了部分变更清理路径；发现并修复了 namespace 路径失效、跨 namespace bind 源和 D-Bus DeviceAllow 追加语义问题。
+- Fedora 验收另覆盖了 SELinux 文件标签与执行入口：补齐 rootfs 标签，并让 root 命令先通过 `setpriv` 进入目标域，保留 `ldconfig` 等程序的正常类型转换。失败后的设备授权、挂载和文件清理得到实测，未新增自定义 SELinux 策略。
 
-测试 VM 上保留 `nvidia-nspawn-test` 容器、Sample 和源码副本；原始 JSON 证据位于测试用户的 `~/nvidia-nspawn-test/results/`。该容器的测试组名为 `nvidia-gpu`（485）和 `nvidia-render`（488）。
+两台测试 VM 均保留 `nvidia-nspawn-test` 容器、Sample 和源码副本；原始证据位于测试用户的 `~/nvidia-nspawn-test/results/`。openSUSE 容器的测试组为 `nvidia-gpu`（485）和 `nvidia-render`（488）；Fedora 原生普通用户服务配置补充 GID 39（该 Ubuntu rootfs 中的组名为 `irc`），未修改持久用户组成员。
 
 ## 本地检查
 

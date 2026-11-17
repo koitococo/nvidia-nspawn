@@ -230,25 +230,30 @@ def dispatch(request: dict, fds: list[int]) -> dict:
         command = request["argv"]
         env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                "LANG": "C", **request.get("env", {})}
-        if request.get("user"):
+        if request.get("user") or request["target"].get("selinux") != "disabled":
             binary = next((p for p in ("/usr/bin/setpriv", "/bin/setpriv")
                            if os.access(p, os.X_OK)), None)
             if not binary:
-                raise RuntimeError("Container setpriv is required for ordinary-user verification")
-            # Resolve NSS identity with container executables, not host libc/NSS
-            # modules loaded into this worker. Extra CDI groups are process-local.
-            identity_env = {"PATH": env["PATH"], "LANG": "C"}
-            def identity(option: str) -> str:
-                result = subprocess.run(["id", option, "--", request["user"]],
-                                        text=True, capture_output=True, env=identity_env)
-                if result.returncode:
-                    raise RuntimeError(result.stderr)
-                return result.stdout.strip()
-            gid = identity("-g")
-            groups = sorted(set(map(int, identity("-G").split()))
-                            | set(request.get("additional_gids", [])))
-            command = [binary, "--reuid", request["user"], "--regid", gid,
-                       "--groups", ",".join(map(str, groups)), "--", *command]
+                raise RuntimeError("Container setpriv is required for SELinux or ordinary-user execution")
+            if request.get("user"):
+                # Resolve NSS identity with container executables, not host libc/NSS
+                # modules loaded into this worker. Extra CDI groups are process-local.
+                identity_env = {"PATH": env["PATH"], "LANG": "C"}
+                def identity(option: str) -> str:
+                    result = subprocess.run(["id", option, "--", request["user"]],
+                                            text=True, capture_output=True, env=identity_env)
+                    if result.returncode:
+                        raise RuntimeError(result.stderr)
+                    return result.stdout.strip()
+                gid = identity("-g")
+                groups = sorted(set(map(int, identity("-G").split()))
+                                | set(request.get("additional_gids", [])))
+                command = [binary, "--reuid", request["user"], "--regid", gid,
+                           "--groups", ",".join(map(str, groups)), "--", *command]
+            else:
+                # Enter the target domain through a normal container entrypoint,
+                # then allow the payload's usual SELinux type transitions.
+                command = [binary, "--", *command]
         os.execvpe(command[0], command, env)
     raise RuntimeError(f"Unknown namespace worker operation: {operation}")
 
