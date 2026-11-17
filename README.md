@@ -201,6 +201,31 @@ nvidia-nspawn --help
 
 实际入口安装在发行版的 `%{_libexecdir}/nvidia-nspawn/cli`，`/usr/bin/nvidia-nspawn` 是指向它的符号链接。这样沿用标准 SELinux 文件标签，避免 Fedora 将普通 `/usr/bin/nvidia.*` 文件误归为 X server 入口，不需要额外放行策略。
 
+### 导入发布公钥并安装签名包
+
+签名流程启用后的新 Release 会附带 `nvidia-nspawn-signing.asc`。仓库内同一公钥位于 [`packaging/keys/nvidia-nspawn.asc`](packaging/keys/nvidia-nspawn.asc)。先从可信渠道核对完整指纹：
+
+```text
+55CF C112 F805 2161 EE8A A2FC 4A2A 1BDE 7C40 9A1D
+```
+
+密钥身份为 `nvidia-nspawn RPM Signing <koitococo@outlook.com>`，RSA 4096；有效期从 **2026-11-17 到 2027-11-17（365 天）**。公钥与 RPM 从同处下载并不能独立建立发布者信任；导入前应核对指纹，密钥更换或续期时也应重新核对。
+
+从对应 Release 下载公钥、目标发行版 RPM 和 `SHA256SUMS`，或在已核实的源码 checkout 中使用仓库公钥：
+
+```bash
+gpg --show-keys --with-fingerprint packaging/keys/nvidia-nspawn.asc
+sudo rpmkeys --import packaging/keys/nvidia-nspawn.asc
+
+# 按实际下载文件名替换；签名和摘要都必须验证成功
+rpmkeys --checksig --verbose ./nvidia-nspawn-*.rpm
+sudo rpm -Uvh ./对应发行版的签名包.noarch.rpm
+```
+
+若使用 Release 附件公钥，将命令中的公钥路径替换为 `./nvidia-nspawn-signing.asc`。安装签名包不应使用 `--nosignature`。`rpm` 不自动补装缺失依赖，仍需先满足前述运行依赖。
+
+本地运行 `build-rpm.sh` 仅构建未签名 RPM；上述公钥只验证实际经过发布签名流程的包。请以对应 Release 的说明和实际验签结果为准。
+
 ### 运行依赖与边界
 
 | 依赖 | Fedora | openSUSE Leap |
@@ -225,8 +250,11 @@ nvidia-nspawn --help
 - Fedora 二进制与源码 RPM：文件名包含 `.fc45`。
 - openSUSE Leap 二进制与源码 RPM：文件名包含 `.lp160`，避免混淆两版产物。
 - `SHA256SUMS`：上述四个 RPM 的下载完整性校验清单。
+- `nvidia-nspawn-signing.asc`：供用户核对指纹后导入的发布公钥。
 
-不需要额外 PAT。仓库必须允许 GitHub Actions 运行及发布任务使用 `contents: write`；构建任务仅有 `contents: read`，不配置发布令牌。CI 不安装 NVIDIA 驱动或运行 GPU 验收，不能将打包测试等同于真实硬件兼容性证明。自动发布的 RPM **未签名**，校验和也不代替签名。
+新的签名版本会在发布前对四个 RPM 签名并验证，再生成 `SHA256SUMS`。构建和签名全部成功后才发布，不会在签名失败时退回未签名包。CI 不运行 GPU 验收，不能将打包测试等同于真实硬件兼容性证明。
+
+也可在 Actions 的 `Release RPMs` 页面手动运行构建，填写与源码版本一致的 `version_tag`。手动运行执行相同的构建、签名与验证，产物保存为 `signed-rpms` artifact，**不会创建 tag 或发布 Release**；artifact 保留 7 天。
 
 发布前先提交并推送 workflow 和对应版本的源码，再创建、推送 tag，例如：
 

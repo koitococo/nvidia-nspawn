@@ -1,5 +1,7 @@
 include SPEC.md
 include packaging/nvidia-nspawn.spec
 include packaging/build-rpm.sh
+include packaging/sign-rpms.sh
+include packaging/keys/nvidia-nspawn.asc
 include man/nvidia-nspawn.8
 recursive-include tests test_*.py

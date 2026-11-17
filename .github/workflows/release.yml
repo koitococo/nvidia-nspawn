@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: Version to validate and build (no Release is published)
+        required: true
+        default: v0.1.0
+        type: string
 
 permissions:
   contents: read
@@ -28,7 +35,7 @@ jobs:
         shell: bash
     env:
       DISTRO: ${{ matrix.distro }}
-      TAG_NAME: ${{ github.ref_name }}
+      TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.version_tag || github.ref_name }}
     steps:
       - name: Install native build dependencies
         run: |
@@ -73,8 +80,18 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      TAG_NAME: ${{ github.ref_name }}
+      TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.version_tag || github.ref_name }}
     steps:
+      - name: Install RPM signing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends rpm gnupg
+
+      - name: Check out public signing key and scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download both distribution builds
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -82,14 +99,38 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Create checksums and publish the tagged release
+      - name: Sign and verify both distribution RPMs
+        shell: bash
+        env:
+          RPM_SIGNING_PRIVATE_KEY: ${{ secrets.RPM_SIGNING_PRIVATE_KEY }}
+          RPM_SIGNING_PASSPHRASE: ${{ secrets.RPM_SIGNING_PASSPHRASE }}
+        run: bash packaging/sign-rpms.sh release-assets
+
+      - name: Create checksums for signed assets
         working-directory: release-assets
         shell: bash
         run: |
           set -euo pipefail
-          sha256sum -- *.rpm > SHA256SUMS
-          gh release create "$TAG_NAME" ./*.rpm SHA256SUMS \
+          sha256sum -- *.rpm nvidia-nspawn-signing.asc > SHA256SUMS
+
+      - name: Upload signed assets for manual builds
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-rpms
+          path: release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Publish the tagged release
+        if: github.event_name == 'push'
+        working-directory: release-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG_NAME" ./*.rpm nvidia-nspawn-signing.asc SHA256SUMS \
             --verify-tag \
             --title "nvidia-nspawn $TAG_NAME" \
             --generate-notes \
-            --notes 'Native noarch RPMs and source RPMs for Fedora 45 (.fc45) and openSUSE Leap 16.0 (.lp160). RPMs are unsigned; SHA256SUMS provides download integrity checks, not a package signature. Build-time tests do not replace real GPU acceptance.'
+            --notes 'OpenPGP-signed native noarch RPMs and source RPMs for Fedora 45 (.fc45) and openSUSE Leap 16.0 (.lp160). Verify the published signing-key fingerprint before importing nvidia-nspawn-signing.asc, then verify RPM signatures. SHA256SUMS covers the signed files. Build-time tests do not replace real GPU acceptance.'
