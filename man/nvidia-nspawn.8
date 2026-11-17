@@ -1,4 +1,4 @@
-.TH NVIDIA-NSPAWN 8 "2026-11-17" "nvidia-nspawn 0.1.0" "System Administration"
+.TH NVIDIA-NSPAWN 8 "2026-11-17" "nvidia-nspawn 0.1.1" "System Administration"
 .SH NAME
 nvidia\-nspawn \- inject NVIDIA GPUs into running systemd-nspawn containers
 .SH SYNOPSIS
@@ -125,13 +125,21 @@ For verification, prepare the CUDA Sample and its runtime dependencies in advanc
 A CUDA compiler and NVIDIA Container Toolkit are not required inside the
 container.
 .PP
-The container must use a separate user namespace, and neither its UID nor GID
-mapping may include host ID 0.
-The standard nspawn
-.B \-U
-configuration meets this requirement.
-Targets sharing the caller's user namespace or mapping host root are rejected
-before attachment changes.
+Both private user namespaces (such as nspawn \-U) and PrivateUsers=no are supported.
+Private UID and GID mappings must not include host ID 0.
+Without a private user namespace, systemd must be PID 1 in the container, its
+system bus must be available, and the host must provide systemd 257 or newer
+with systemd-run and systemctl.
+Container commands and createContainer hooks run as transient services created
+by the guest manager, preserving its capability, seccomp, SELinux and outer
+device constraints rather than inheriting additional host privileges.
+There is no privileged namespace-exec fallback.
+.PP
+Timeout cleanup stops the entire guest service, not merely the host
+systemd-run client.
+If guest processes cannot be confirmed stopped, the attachment and temporary
+resources are retained and reported for explicit recovery instead of being
+unmounted beneath a possibly running command.
 .SH EXAMPLES
 List host GPU UUIDs:
 .PP

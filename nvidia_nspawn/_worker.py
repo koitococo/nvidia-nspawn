@@ -22,20 +22,20 @@ JOURNAL_FD = None
 
 
 def validate_user_namespace(own_namespace: str, target_namespace: str,
-                            uid_map: str, gid_map: str) -> None:
-    if own_namespace == target_namespace:
-        raise ValueError("A separate user namespace with non-root host mappings is required")
+                            uid_map: str, gid_map: str) -> bool:
+    private_users = own_namespace != target_namespace
     for name, mapping in (("UID", uid_map), ("GID", gid_map)):
         root_mapped = False
         for row in mapping.splitlines():
             inside, outside, count = map(int, row.split())
             if inside < 0 or outside < 0 or count <= 0:
                 raise ValueError(f"Invalid {name} mapping")
-            if outside == 0:
+            if private_users and outside == 0:
                 raise ValueError(f"Refusing a {name} mapping that includes host root")
             root_mapped |= inside == 0
         if not root_mapped:
             raise ValueError(f"Container root has no {name} mapping")
+    return private_users
 
 
 def record_change(journal: dict, kind: str, path: str) -> None:
@@ -301,9 +301,11 @@ def main() -> None:
     pid = request["target"]["leader"]
     own_namespace = os.readlink("/proc/self/ns/user")
     target_namespace = os.readlink(f"/proc/{pid}/ns/user")
-    validate_user_namespace(own_namespace, target_namespace,
-                            Path(f"/proc/{pid}/uid_map").read_text(),
-                            Path(f"/proc/{pid}/gid_map").read_text())
+    private_users = validate_user_namespace(
+        own_namespace, target_namespace, Path(f"/proc/{pid}/uid_map").read_text(),
+        Path(f"/proc/{pid}/gid_map").read_text())
+    if not private_users and request["operation"] in ("exec", "hook"):
+        raise ValueError("Shared-user-namespace programs must execute through the guest systemd manager")
     if request["operation"] == "apply" and "journal_fd" in request:
         JOURNAL_FD = request["journal_fd"]
         os.set_inheritable(JOURNAL_FD, False)

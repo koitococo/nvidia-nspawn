@@ -9,7 +9,7 @@ import stat
 import sys
 import tempfile
 
-from . import cdi, host
+from . import cdi, host, native_execution
 from .common import Error, require_root, run
 from ._worker import mount_table, parent_mount
 
@@ -132,9 +132,23 @@ def worker(target: dict, operation: str, *, timeout: int = 60, **kwargs) -> str:
     }), timeout=timeout)
 
 
+def private_users(target: dict) -> bool:
+    """Read the live namespace for attachment records predating this field."""
+    if "private_users" in target:
+        return target["private_users"]
+    assert_identity(target)
+    return (os.readlink(f"/proc/{target['leader']}/ns/user")
+            != os.readlink("/proc/self/ns/user"))
+
+
 def exec_container(target: dict, argv: list[str], *, user: str | None = None,
                    env: dict | None = None, timeout: int = 60,
                    additional_gids: list[int] | None = None) -> str:
+    if not private_users(target):
+        assert_identity(target)
+        return native_execution.execute(
+            target, argv, user=user, env=env, timeout=timeout,
+            additional_gids=additional_gids)
     return worker(target, "exec", argv=argv, user=user, env=env or {}, timeout=timeout,
                   additional_gids=additional_gids or [])
 
@@ -195,6 +209,8 @@ def plan(machine: str, gpu: str) -> dict:
             raise Error(f"Required host executable is missing: {binary}")
     state_path(machine)  # Validate before using the name in state storage.
     target = host.discover(machine)
+    if not private_users(target):
+        native_execution.preflight(target)
     edits = cdi.generate(gpu)
     items = resources(edits)
     for item in items:
@@ -268,6 +284,15 @@ def validate_destinations(items: list, edits: dict, observation: dict) -> None:
 
 def apply_hooks(state: dict, stage: str) -> None:
     target, edits = state["target"], state["plan"]
+    if stage == "createContainer" and not private_users(target):
+        from .native_hooks import execute_hook
+
+        for hook, action in zip(edits["hooks"], edits["hook_actions"]):
+            if hook["hookName"] == stage and action["kind"] not in (
+                    "create-symlinks", "update-ldcache"):
+                execute_hook(state, hook)
+        exec_container(target, [state["before"]["ldconfig"]])
+        return
     # Supply the standard bundle/config.json fallback for older Toolkit versions
     # as well as the root extension understood by recent versions.
     with tempfile.TemporaryDirectory(prefix="nvidia-nspawn-") as bundle:
@@ -365,6 +390,12 @@ def attach(machine: str, gpu: str) -> dict:
         return result
     except Exception as exc:
         cleanup_errors = []
+        if not getattr(exc, "safe_to_cleanup", True):
+            state.update(phase="failed", error=str(exc), cleanup_errors=[
+                "Guest execution could not be confirmed stopped; attachment resources "
+                "and device permissions retained for explicit recovery"])
+            save_state(state)
+            raise Error(f"Attach failed: {exc}\nResources retained; inspect {state_path(machine)}") from exc
         if isinstance(exc, WorkerError):
             state["journal"] = exc.journal
             cleanup_errors.extend(exc.journal_errors)

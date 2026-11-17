@@ -39,7 +39,7 @@ def discover(machine: str) -> dict:
     result["uid_map"] = Path(f"/proc/{pid}/uid_map").read_text()
     result["gid_map"] = Path(f"/proc/{pid}/gid_map").read_text()
     try:
-        validate_user_namespace(
+        result["private_users"] = validate_user_namespace(
             os.readlink("/proc/self/ns/user"), os.readlink(f"/proc/{pid}/ns/user"),
             result["uid_map"], result["gid_map"])
     except ValueError as exc:

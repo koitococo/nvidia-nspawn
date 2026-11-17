@@ -6,7 +6,7 @@
 
 ## 当前验证状态
 
-已实现 `plan`、`attach`、`status`、`verify`，本地 **52 个测试通过**，并在 openSUSE Leap 16.0 和 Fedora 45 专用 GPU VM 上完成在线注入、普通用户 CUDA、重复注入和设备拒绝负向验收。
+已实现 `plan`、`attach`、`status`、`verify`，本地 **55 个测试通过**，并在 openSUSE Leap 16.0 和 Fedora 45 专用 GPU VM 上完成在线注入、普通用户 CUDA、重复注入和设备拒绝负向验收。
 
 Fedora 实测保留 SELinux enforcing 和 Secure Boot。标准 nspawn 模板的实际进程域为 `unconfined_service_t`；这不代表已验证自定义 `container_t` 等受限域。
 
@@ -15,7 +15,7 @@ Fedora 实测保留 SELinux enforcing 和 Secure Boot。标准 nspawn 模板的�
 宿主机：
 
 - Linux、cgroup v2、运行中的 systemd-nspawn 容器，以及提供 `open_tree`、`move_mount`、`mount_setattr` 的内核和 glibc。
-- Python 3.11+、`machinectl`、`busctl`。
+- Python 3.11+、`machinectl`、`busctl`；无用户命名空间模式还需要宿主 systemd 257+ 的 `systemd-run`、`systemctl`。
 - NVIDIA 专有驱动已经加载，宿主机 `nvidia-smi` 正常。
 - NVIDIA Container Toolkit，提供 `nvidia-ctk cdi generate --format=json --device-name-strategy=uuid` 及生成描述所引用的 hooks。
 - 启用 SELinux 时，需要 `libselinux.so.1`。工具不关闭 SELinux。
@@ -23,8 +23,8 @@ Fedora 实测保留 SELinux enforcing 和 Secure Boot。标准 nspawn 模板的�
 
 容器：
 
-- 必须有独立用户命名空间，且 UID/GID 映射均不得包含宿主机 ID 0；标准 nspawn `-U` 配置符合此要求。共享宿主用户命名空间、关闭用户映射或映射宿主 root 的目标在变更前被拒绝。
-
+- 支持标准 nspawn `-U` 用户映射，也支持 `PrivateUsers=no`。独立用户命名空间的 UID/GID 映射仍不得包含宿主机 ID 0。
+- `PrivateUsers=no` 时，容器必须以 systemd 为 PID 1，且容器系统总线可用；工具通过容器自身的 transient service 执行程序和 hooks，不把宿主 root 的额外 capabilities 或无 seccomp 的执行环境带入容器。不提供特权 namespace-exec 降级路径。
 - 容器中有 `ldconfig`、`setpriv`、`id`、`readlink`，以及已有普通用户。
 - 尚未安装或注入冲突的 NVIDIA 驱动文件。
 - 已准备真实 NVIDIA CUDA Samples `vectorAdd` 可执行文件及其 runtime 依赖，CUDA 版本与 GPU/宿主驱动兼容。
@@ -100,7 +100,7 @@ sudo python3 -m nvidia_nspawn verify \
 4. 用 glibc `LD_DEBUG=libs` 的实际初始化记录和容器路径解析，核对 NVML/libcuda 来自注入的驱动，而不是仅检查 `ldd` 或库搜索候选。
 5. 前后核对容器运行实例及宿主机驱动。
 
-验证子进程进入目标 cgroup 和 namespaces，并在启用 SELinux 时通过容器自己的 `setpriv` 入口进入目标域，再允许程序正常发生 SELinux 类型转换，避免宿主机权限绕过或强制载荷入口域造成错误。CDI 环境变量及 `additionalGids` 只应用于工具启动的验证进程，不修改现有 shell、用户的持久组成员或宿主机设备权限。正常使用 `nvidia-smi` 不依赖临时 `LD_LIBRARY_PATH`；从其他入口启动应用时，管理员仍需为该用户或服务配置对应 GPU 组。
+有用户映射时，验证子进程进入目标 cgroup 和 namespaces，并在启用 SELinux 时通过容器自己的 `setpriv` 入口进入目标域，再允许程序正常发生 SELinux 类型转换。无用户映射时，由容器自身 systemd 创建普通用户 transient service，保留容器的 capabilities、seccomp、SELinux 和外层设备限制；超时会停止整个 guest service，不能仅终止宿主 `systemd-run` 客户端。CDI 环境变量及 `additionalGids` 只应用于工具启动的验证进程，不修改现有 shell、用户的持久组成员或宿主机设备权限。正常使用 `nvidia-smi` 不依赖临时 `LD_LIBRARY_PATH`；从其他入口启动应用时，管理员仍需为该用户或服务配置对应 GPU 组。
 
 支持已核实的 `vectorAdd` 输出契约，包括历史版本的 `Test PASSED` 和新版统一内存示例的结果匹配标记。源码版本、构建 CUDA 版本、架构参数需由 Sample 提供者另行记录；输出标记不能证明任意二进制的来源。
 
@@ -147,11 +147,12 @@ sudo python3 -m nvidia_nspawn verify \
 - 注入前，普通用户没有 NVIDIA 设备和 `nvidia-smi`，真实 `vectorAdd` 失败。
 - 注入后，UID 1000 的普通用户查询到选定 GPU；`vectorAdd` 执行 50,000 元素向量加法并报告 `Test PASSED`，成功退出。
 - NVML 和 libcuda 的实际加载路径均解析到注入的 580.196.07 版本化库。
-- 重复 `attach` 前后，容器挂载数保持 95；leader PID 和注入前的常驻 sentinel 进程均不变。
+- 重复 `attach` 前后，原 `-U` fixture 挂载数保持 95，无用户映射 fixture 挂载数保持 89；容器 leader 和注入前已有进程保持运行。
 - 从目标宿主机 unit 撤销 GPU `DeviceAllow` 后，同一验证入口在 `nvidia-smi` 阶段因 NVML 初始化失败而被拒绝；恢复后再次完整验证通过。
 - 不依赖项目执行工作器，使用容器自己的 systemd 启动普通用户服务，配置对应补充组后，`nvidia-smi` 和 `vectorAdd` 同样成功；未设置 `LD_LIBRARY_PATH`。
 - 测试期间的挂载/hook 失败覆盖了部分变更清理路径；发现并修复了 namespace 路径失效、跨 namespace bind 源和 D-Bus DeviceAllow 追加语义问题。
 - Fedora 验收另覆盖了 SELinux 文件标签与执行入口：补齐 rootfs 标签，并让 root 命令先通过 `setpriv` 进入目标域，保留 `ldconfig` 等程序的正常类型转换。失败后的设备授权、挂载和文件清理得到实测，未新增自定义 SELinux 策略。
+- 两版均验证 `PrivateUsers=no`：容器命令由 guest systemd 执行，其 capabilities／seccomp／SELinux 与正常容器服务一致，不具备 `CAP_SYS_TIME`；超时后整个服务及其子进程退出。临时 hook 挂载清理完成，普通用户 CUDA、重复注入和设备拒绝恢复均通过；原有 `-U` 容器验证仍成功。
 
 两台测试 VM 均保留 `nvidia-nspawn-test` 容器、Sample 和源码副本；原始证据位于测试用户的 `~/nvidia-nspawn-test/results/`。openSUSE 容器的测试组为 `nvidia-gpu`（485）和 `nvidia-render`（488）；Fedora 原生普通用户服务配置补充 GID 39（该 Ubuntu rootfs 中的组名为 `irc`），未修改持久用户组成员。
 
@@ -184,16 +185,16 @@ sudo zypper install rpm-build python-rpm-macros python3-devel \
 ```bash
 python3 -c 'from setuptools.build_meta import build_sdist; build_sdist("dist")'
 mkdir -p ~/rpmbuild/SOURCES
-cp dist/nvidia_nspawn-0.1.0.tar.gz ~/rpmbuild/SOURCES/
+cp dist/nvidia_nspawn-0.1.1.tar.gz ~/rpmbuild/SOURCES/
 rpmbuild -ba packaging/nvidia-nspawn.spec
 ```
 
 二进制包在 `~/rpmbuild/RPMS/noarch/`，源码 RPM 在 `~/rpmbuild/SRPMS/`。`%check` 对构建根目录中的 Python 包运行算法测试，不需要 GPU。
 
 ```bash
-# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.0-4.noarch.rpm
+# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.1-1.noarch.rpm
 # --nosignature 仅用于自己构建的未签名包，不跳过摘要或依赖检查
-sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.0-4.fc45.noarch.rpm
+sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.1-1.fc45.noarch.rpm
 nvidia-nspawn --help
 ```
 
@@ -243,7 +244,7 @@ sudo rpm -Uvh ./对应发行版的签名包.noarch.rpm
 
 ## GitHub Release 自动发布
 
-`.github/workflows/release.yml` 在推送 `v*` tag 时运行。正式发布 tag 必须是 `vX.Y.Z`，并且与 `pyproject.toml` 和 RPM spec 的 `Version` 完全一致；不匹配的 tag 会构建失败，不会发布。当前版本对应 `v0.1.0`。
+`.github/workflows/release.yml` 在推送 `v*` tag 时运行。正式发布 tag 必须是 `vX.Y.Z`，并且与 `pyproject.toml` 和 RPM spec 的 `Version` 完全一致；不匹配的 tag 会构建失败，不会发布。当前版本对应 `v0.1.1`。
 
 工作流在 Fedora 45、openSUSE Leap 16.0 的官方容器中分别安装原生构建依赖并执行 `packaging/build-rpm.sh`，运行 RPM `%check`。两版全部成功后，才使用仓库自带的 `GITHUB_TOKEN` 创建 Release 并上传：
 
@@ -259,8 +260,8 @@ sudo rpm -Uvh ./对应发行版的签名包.noarch.rpm
 发布前先提交并推送 workflow 和对应版本的源码，再创建、推送 tag，例如：
 
 ```bash
-git tag -a v0.1.0 -m "Release v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "Release v0.1.1"
+git push origin v0.1.1
 ```
 
 不要把示例 tag 推到缺少 workflow 的旧提交。已有 tag 不会因为后来添加 workflow 自动补跑；已有 Release 也不会被自动覆盖。版本升级时同步更新 `pyproject.toml`、RPM spec 的版本和 man page 中的版本说明；同版本 RPM 修订的本地重建不等同于新的 `vX.Y.Z` 发布。
@@ -268,9 +269,9 @@ git push origin v0.1.0
 在匹配发行版上安装前述构建依赖后，也可运行同一构建脚本：
 
 ```bash
-TAG_NAME=v0.1.0 bash packaging/build-rpm.sh fedora45 dist/release
+TAG_NAME=v0.1.1 bash packaging/build-rpm.sh fedora45 dist/release
 # openSUSE Leap 16.0:
-TAG_NAME=v0.1.0 bash packaging/build-rpm.sh opensuse-leap16 dist/release
+TAG_NAME=v0.1.1 bash packaging/build-rpm.sh opensuse-leap16 dist/release
 ```
 
 ## 本地检查
