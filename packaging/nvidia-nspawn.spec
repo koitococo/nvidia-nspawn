@@ -1,6 +1,6 @@
 Name:           nvidia-nspawn
 Version:        0.1.0
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Live NVIDIA GPU injection for systemd-nspawn containers
 License:        MIT
 Source0:        nvidia_nspawn-%{version}.tar.gz
@@ -54,6 +54,7 @@ export PIP_NO_INDEX=1
 install -d %{buildroot}%{_libexecdir}/%{name}
 mv %{buildroot}%{_bindir}/nvidia-nspawn %{buildroot}%{_libexecdir}/%{name}/cli
 ln -s %{_libexecdir}/%{name}/cli %{buildroot}%{_bindir}/nvidia-nspawn
+install -D -m 0644 man/nvidia-nspawn.8 %{buildroot}%{_mandir}/man8/nvidia-nspawn.8
 
 %check
 PYTHONPATH=%{buildroot}%{python3_sitelib} %{__python3} -P -m unittest discover -s tests -v
@@ -65,8 +66,12 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{__python3} -P -m unittest discover -
 %{_libexecdir}/%{name}/
 %{python3_sitelib}/nvidia_nspawn/
 %{python3_sitelib}/nvidia_nspawn-%{version}.dist-info/
+%{_mandir}/man8/nvidia-nspawn.8*
 
 %changelog
+* Tue Nov 17 2026 Koi to Coco <koitococo@outlook.com> - 0.1.0-3
+- Install the administrator manual in section 8.
+
 * Tue Nov 17 2026 Koi to Coco <koitococo@outlook.com> - 0.1.0-2
 - Preserve the default SELinux domain with a libexec entrypoint.
 

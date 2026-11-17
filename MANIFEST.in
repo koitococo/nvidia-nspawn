@@ -1,3 +1,4 @@
 include SPEC.md
 include packaging/nvidia-nspawn.spec
+include man/nvidia-nspawn.8
 recursive-include tests test_*.py

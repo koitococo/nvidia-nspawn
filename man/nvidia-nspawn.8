@@ -1,0 +1,216 @@
+.TH NVIDIA-NSPAWN 8 "2026-11-17" "nvidia-nspawn 0.1.0" "System Administration"
+.SH NAME
+nvidia\-nspawn \- inject NVIDIA GPUs into running systemd-nspawn containers
+.SH SYNOPSIS
+.B nvidia\-nspawn plan
+.BI \-\-machine " MACHINE"
+.BI \-\-gpu " GPU_UUID"
+.br
+.B nvidia\-nspawn attach
+.BI \-\-machine " MACHINE"
+.BI \-\-gpu " GPU_UUID"
+.br
+.B nvidia\-nspawn status
+.BI \-\-machine " MACHINE"
+.br
+.B nvidia\-nspawn verify
+.BI \-\-machine " MACHINE"
+.BI \-\-user " USER"
+.BI \-\-cuda\-sample " PATH"
+.SH DESCRIPTION
+.B nvidia\-nspawn
+runs on the host as root and injects NVIDIA device nodes and userspace driver
+files into an already running
+.BR systemd-nspawn (1)
+container.
+It uses NVIDIA Container Toolkit CDI descriptions, transfers mounts into the
+existing container mount namespace, and updates the owning systemd unit's
+runtime device permissions.
+The container is not restarted.
+.PP
+Normal command results are JSON on standard output.
+Failures are reported on standard error.
+.SH COMMANDS
+.TP
+.B plan
+Inspect the container, selected GPU, CDI edits, destination paths, user mappings,
+and device policy; print the proposed attachment without applying it.
+Conflicting files, unsafe mount propagation, and unsupported CDI edits are
+rejected.
+.TP
+.B attach
+Apply the attachment to the current container instance.
+Preserve existing device permissions and the container's own libc and loader.
+Repeated successful attachment of the same GPU to the same instance does not
+stack duplicate mounts.
+Replacing a GPU or overwriting a previous failed attachment is not supported.
+.TP
+.B status
+Report the recorded attachment phase and whether mounts, device nodes, and the
+host driver match the attachment.
+The JSON field
+.B healthy
+is not a GPU functional test and does not replace
+.BR verify .
+.TP
+.B verify
+Require a healthy attachment and execute GPU checks as an existing non-root
+container user.
+Check the user's UID, GPU UUID, driver version, and a real NVIDIA CUDA Samples
+.B vectorAdd
+executable.
+Require a successful CUDA calculation and verify actual NVML and libcuda loading
+from the injected driver files using loader diagnostics.
+.PP
+Verification processes join the target cgroup and namespaces and use the target
+SELinux execution domain when SELinux is enabled.
+CDI environment settings and supplementary groups apply only to processes
+launched by the tool; they do not change persistent user group membership or
+existing shells.
+Other application launchers must configure any required GPU groups themselves.
+.SH OPTIONS
+.TP
+.BI \-\-machine " MACHINE"
+Name of a running, registered systemd-nspawn container.
+Required for every subcommand.
+.TP
+.BI \-\-gpu " GPU_UUID"
+Complete NVIDIA GPU UUID beginning with
+.BR GPU\- .
+Required for
+.B plan
+and
+.BR attach .
+Obtain UUIDs with
+.BR "nvidia-smi -L" .
+.TP
+.BI \-\-user " USER"
+Existing non-root user inside the container.
+Required for
+.BR verify .
+.TP
+.BI \-\-cuda\-sample " PATH"
+Absolute container path to a real, executable NVIDIA CUDA Samples
+.B vectorAdd
+binary with compatible runtime dependencies.
+Required for
+.BR verify .
+.TP
+.BR \-h ", " \-\-help
+Show command or subcommand help and exit.
+Help does not require root.
+.SH REQUIREMENTS
+The host needs Python 3.11 or later, systemd, machinectl, busctl, cgroup v2,
+and an already working NVIDIA driver with nvidia-smi, NVML, and libcuda.
+The tested NVIDIA Container Toolkit version is 1.20.2; RPM packages require
+.B nvidia-container-toolkit-base
+1.20.2 or later.
+The tool does not install or select a driver branch.
+.PP
+The kernel and libc must expose
+.BR open_tree (2),
+.BR move_mount (2),
+and
+.BR mount_setattr (2).
+The mount_setattr API requires Linux 5.12 and glibc 2.36 or later.
+Required privileges, namespace permissions, and filesystem support must also
+be available; version numbers alone do not guarantee compatibility.
+When SELinux is enabled,
+.B libselinux.so.1
+must be available on the host.
+.PP
+The container needs ldconfig, setpriv, id, readlink, and the specified ordinary
+user.
+For verification, prepare the CUDA Sample and its runtime dependencies in advance.
+A CUDA compiler and NVIDIA Container Toolkit are not required inside the
+container.
+.SH EXAMPLES
+List host GPU UUIDs:
+.PP
+.EX
+nvidia-smi -L
+.EE
+.PP
+In the commands below, replace
+.B GPU_UUID
+with one complete UUID from that output, and replace the container name, user,
+and Sample path with existing values:
+.PP
+.EX
+sudo nvidia-nspawn plan --machine gpu-test --gpu GPU_UUID
+sudo nvidia-nspawn attach --machine gpu-test --gpu GPU_UUID
+sudo nvidia-nspawn status --machine gpu-test
+sudo nvidia-nspawn verify --machine gpu-test --user developer \e
+  --cuda-sample /opt/cuda-samples/vectorAdd
+.EE
+.PP
+Open this manual or subcommand help:
+.PP
+.EX
+man 8 nvidia-nspawn
+nvidia-nspawn verify --help
+.EE
+.SH FILES
+.TP
+.I /run/nvidia-nspawn/MACHINE.json
+Host-side runtime record of container identity, GPU, resource fingerprints,
+change journal, and failure information.
+This is runtime state, not a persistent container configuration.
+.TP
+.I /etc/ld.so.conf.d/nvidia-nspawn.conf
+Managed driver library search directories inside the container.
+The container's own ldconfig updates its loader cache.
+.SH LIFECYCLE AND FAILURES
+Attachments are runtime-only and do not persist across container restarts.
+Driver upgrades are not applied to existing attachments automatically.
+After a restart, inspect the new container instance and any remaining managed
+files before attaching again; stale files are not forcibly overwritten.
+.PP
+On attachment failure the tool attempts to undo new mounts, files, device nodes,
+and device permission changes.
+Cleanup failures and residual changes are reported rather than hidden.
+Inspect the failure record before retrying.
+Do not blindly delete recorded paths: some refer to container resources, and
+existing user files must be preserved.
+.PP
+No live GPU detach command or GPU memory quota configuration is provided.
+Already running applications are not made to reload driver libraries.
+.SH SECURITY
+Run on the host, not inside the target container.
+The tool does not disable SELinux, change host device ownership or modes,
+modify Secure Boot, reload drivers, or restart containers.
+It does not bypass parent cgroup restrictions or SELinux policy.
+.PP
+Ensure that imported container root filesystems have appropriate SELinux file
+labels.
+Relabel only the container's backing directory, not a live
+.I /proc/LEADER/root
+view containing host bind mounts, to avoid relabeling host driver files.
+.PP
+The Fedora validation used SELinux enforcing with the standard nspawn process
+domain
+.BR unconfined_service_t .
+It does not establish compatibility with custom confined domains such as
+.BR container_t .
+.SH EXIT STATUS
+.TP
+.B 0
+The command completed, or help was displayed.
+For
+.BR status ,
+this does not imply that
+.B healthy
+is true; inspect the JSON result.
+.TP
+.B 1
+An operation, permission check, prerequisite, or verification failed.
+.TP
+.B 2
+Command-line usage was invalid, such as a missing required argument.
+.SH SEE ALSO
+.BR systemd-nspawn (1),
+.BR machinectl (1),
+.BR busctl (1),
+.BR setpriv (1),
+.BR ldconfig (8),
+.BR nvidia-smi (1)

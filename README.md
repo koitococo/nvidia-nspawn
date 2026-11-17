@@ -51,6 +51,8 @@ python3 -m nvidia_nspawn --help
 
 也可以通过 Python 包管理工具安装项目，获得 `nvidia-nspawn` 命令。构建使用 setuptools；运行时仅使用 Python 标准库和上述宿主机工具。
 
+RPM 同时安装系统管理员手册，可通过 `man 8 nvidia-nspawn` 阅读完整参数、示例、退出码、状态文件和安全边界。手册源文件为 `man/nvidia-nspawn.8`；源码目录中也可运行 `man -l man/nvidia-nspawn.8` 预览。
+
 以下命令在宿主机源码目录运行。替换容器名、完整 GPU UUID、普通用户名和容器内 Sample 路径：
 
 ```bash
@@ -178,9 +180,9 @@ rpmbuild -ba packaging/nvidia-nspawn.spec
 二进制包在 `~/rpmbuild/RPMS/noarch/`，源码 RPM 在 `~/rpmbuild/SRPMS/`。`%check` 对构建根目录中的 Python 包运行算法测试，不需要 GPU。
 
 ```bash
-# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.0-2.noarch.rpm
+# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.0-3.noarch.rpm
 # --nosignature 仅用于自己构建的未签名包，不跳过摘要或依赖检查
-sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.0-2.fc45.noarch.rpm
+sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.0-3.fc45.noarch.rpm
 nvidia-nspawn --help
 ```
 
