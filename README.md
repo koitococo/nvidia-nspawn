@@ -216,6 +216,35 @@ nvidia-nspawn --help
 
 宿主 RPM 不向容器安装软件；容器中的 `ldconfig`、`setpriv`、`id`、`readlink`、普通用户和验证用 CUDA Sample 仍需提前准备。不要将 Toolkit、驱动库、Sample、缓存或 `/run/nvidia-nspawn` 的运行状态打入项目 RPM。
 
+## GitHub Release 自动发布
+
+`.github/workflows/release.yml` 在推送 `v*` tag 时运行。正式发布 tag 必须是 `vX.Y.Z`，并且与 `pyproject.toml` 和 RPM spec 的 `Version` 完全一致；不匹配的 tag 会构建失败，不会发布。当前版本对应 `v0.1.0`。
+
+工作流在 Fedora 45、openSUSE Leap 16.0 的官方容器中分别安装原生构建依赖并执行 `packaging/build-rpm.sh`，运行 RPM `%check`。两版全部成功后，才使用仓库自带的 `GITHUB_TOKEN` 创建 Release 并上传：
+
+- Fedora 二进制与源码 RPM：文件名包含 `.fc45`。
+- openSUSE Leap 二进制与源码 RPM：文件名包含 `.lp160`，避免混淆两版产物。
+- `SHA256SUMS`：上述四个 RPM 的下载完整性校验清单。
+
+不需要额外 PAT。仓库必须允许 GitHub Actions 运行及发布任务使用 `contents: write`；构建任务仅有 `contents: read`，不配置发布令牌。CI 不安装 NVIDIA 驱动或运行 GPU 验收，不能将打包测试等同于真实硬件兼容性证明。自动发布的 RPM **未签名**，校验和也不代替签名。
+
+发布前先提交并推送 workflow 和对应版本的源码，再创建、推送 tag，例如：
+
+```bash
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+不要把示例 tag 推到缺少 workflow 的旧提交。已有 tag 不会因为后来添加 workflow 自动补跑；已有 Release 也不会被自动覆盖。版本升级时同步更新 `pyproject.toml`、RPM spec 的版本和 man page 中的版本说明；同版本 RPM 修订的本地重建不等同于新的 `vX.Y.Z` 发布。
+
+在匹配发行版上安装前述构建依赖后，也可运行同一构建脚本：
+
+```bash
+TAG_NAME=v0.1.0 bash packaging/build-rpm.sh fedora45 dist/release
+# openSUSE Leap 16.0:
+TAG_NAME=v0.1.0 bash packaging/build-rpm.sh opensuse-leap16 dist/release
+```
+
 ## 本地检查
 
 ```bash

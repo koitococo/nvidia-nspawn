@@ -1,0 +1,95 @@
+name: Release RPMs
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.distro }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: fedora45
+            image: registry.fedoraproject.org/fedora:45
+          - distro: opensuse-leap16
+            image: registry.opensuse.org/opensuse/leap:16.0
+    container:
+      image: ${{ matrix.image }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      DISTRO: ${{ matrix.distro }}
+      TAG_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Install native build dependencies
+        run: |
+          set -euo pipefail
+          case "$DISTRO" in
+            fedora45)
+              dnf -y --setopt=install_weak_deps=False install \
+                git tar gzip findutils rpm-build python3-devel \
+                pyproject-rpm-macros python3-pip python3-setuptools python3-wheel
+              ;;
+            opensuse-leap16)
+              zypper --non-interactive install --no-recommends \
+                git tar gzip findutils rpm-build python-rpm-macros python3-devel \
+                python313-pip python313-setuptools python313-wheel
+              ;;
+          esac
+
+      - name: Check out the pushed tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate version and build RPMs
+        run: bash packaging/build-rpm.sh "$DISTRO" "$GITHUB_WORKSPACE/dist/release"
+
+      - name: Upload distribution RPMs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rpm-${{ matrix.distro }}
+          path: dist/release/*.rpm
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Download both distribution builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rpm-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums and publish the tagged release
+        working-directory: release-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -- *.rpm > SHA256SUMS
+          gh release create "$TAG_NAME" ./*.rpm SHA256SUMS \
+            --verify-tag \
+            --title "nvidia-nspawn $TAG_NAME" \
+            --generate-notes \
+            --notes 'Native noarch RPMs and source RPMs for Fedora 45 (.fc45) and openSUSE Leap 16.0 (.lp160). RPMs are unsigned; SHA256SUMS provides download integrity checks, not a package signature. Build-time tests do not replace real GPU acceptance.'
