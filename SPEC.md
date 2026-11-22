@@ -62,8 +62,8 @@
 以下为 CLI 行为契约，名称可在实现时统一调整，但能力不可省略。
 
 ```text
-nvidia-nspawn plan   --machine NAME --gpu GPU-UUID
-nvidia-nspawn attach --machine NAME --gpu GPU-UUID
+nvidia-nspawn plan   --machine NAME --gpu GPU-UUID [--reuse-empty-mountpoints]
+nvidia-nspawn attach --machine NAME --gpu GPU-UUID [--reuse-empty-mountpoints]
 nvidia-nspawn status --machine NAME
 nvidia-nspawn verify --machine NAME --user USER --cuda-sample /path/in/container/vectorAdd
 ```
@@ -74,6 +74,7 @@ nvidia-nspawn verify --machine NAME --user USER --cuda-sample /path/in/container
 - `--cuda-sample` 是容器内已准备好的真实 CUDA Sample 可执行文件路径。
 - `plan` 不修改容器、cgroup、设备权限、动态链接器配置或状态记录；重启后的旧资源回收也仅预览，不执行。
 - `attach` 完成注入；重复执行相同请求不重复堆叠挂载、不累加配置。新运行实例先验证持久记录中的 rootfs 身份和资源指纹，只回收未修改且未挂载的旧工具资源，再注入。
+- `--reuse-empty-mountpoints` 仅用于 `plan` 和 `attach`。默认拒绝复用未经批准的已有绑定挂载目标。`plan` 列出选中的复用路径，不写入批准记录；`attach` 成功才为本次复用保存批准记录。
 - 已有不同 GPU 的注入状态时，首次版本拒绝替换并说明现状，不隐式卸载或扩展。
 - `status` 报告实际挂载、设备和注入实例，不仅回显保存的配置。
 - `verify` 不负责安装依赖；缺失项作为失败报告，不伪造或跳过验证。
@@ -113,6 +114,9 @@ nvidia-nspawn verify --machine NAME --user USER --cuda-sample /path/in/container
 - 处理 Fedora 与 Debian 的路径差异，确保 SONAME、符号链接以及动态链接器搜索路径正确。
 - 容器内 `nvidia-smi` 必须在正常登录/执行环境中可用，不能仅在工具临时设置的 `LD_LIBRARY_PATH` 中成功。
 - 必要的容器侧配置仅写入本工具管理的独立文件；发现冲突时报告，不覆盖用户已有配置。
+- 空挂载目标必须与绑定挂载源的类型匹配：只接受零字节普通文件或没有任何条目的目录，且目标不是挂载点，其下也没有挂载。复用不删除目标或更改其所有者，不放宽设备节点、符号链接或配置文件的冲突检查。
+- 对没有工具归属记录的 `/etc/ld.so.conf.d/nvidia-nspawn.conf`，只有当前 `ldconfig_folders` 非空、目标是普通文件而非符号链接、且内容与生成配置逐字节相同时才自动复用；比较包含 `# Managed by nvidia-nspawn` 标记、按计划顺序排列的目录及末尾换行。无生成配置、类型不符或内容不同均为冲突。
+- `plan` 只读检查上述复用条件，`attach` 在使用前重新检查。复用不改写文件、不改变所有者、不记入变更 journal 或工具资源归属记录，回滚不删除该文件。此行为独立于 `--reuse-empty-mountpoints`，且不适用于 NVIDIA 应用配置 `/etc/nvidia/nvidia-application-profiles-rc.d/10-container.conf`。已归属工具的配置文件继续按既有流程验证和恢复。
 - 容器 rootfs 在停止后仍可能保留配置文件，但运行时挂载和 GPU 授权不承诺在重启后存在；不得据此宣称持久注入。
 
 ### 5.4 cgroup 与设备权限
@@ -168,6 +172,7 @@ nvidia-nspawn verify --machine NAME --user USER --cuda-sample /path/in/container
 - 运行时挂载和 GPU 授权不承诺跨容器或宿主机重启保持有效。容器重新运行后由管理员手工执行 `plan` 和 `attach`；驱动更新后停止继续验证并要求重新规划，不能混用新旧驱动。
 - `/run/nvidia-nspawn/<machine>.json` 保存运行实例、资源指纹、变更 journal 和失败信息；新 `attach` 另在 `/var/lib/nvidia-nspawn/<machine>.json` 持久保存 rootfs 身份及工具创建资源的归属描述。持久归属记录不是持久注入或授权。
 - 新运行实例的 `attach` 仅在 rootfs 身份及旧资源指纹匹配、资源未修改且未挂载时回收旧工具资源，再重新注入。未知文件、已修改资源、rootfs 不匹配或仍挂载时拒绝清理，不以文件名或零字节大小认定归属。旧版无持久归属证据的残留不自动认领或迁移，需管理员核实处理。
+- 持久记录单独保存批准复用的确切路径和指纹，不将这些路径记作工具创建的资源。新运行实例的 `attach` 无需再指定该选项，但只有在同一 rootfs 中该路径的指纹不变，并重新确认仍为空且未挂载（含其下挂载）时，才沿用批准记录。
 - 不自动启动或重启容器或宿主机，不重载正在使用的 NVIDIA 内核模块。
 - 不配置 `ExecStartPost` 或开机自动注入。卸载 RPM 不会 detach 或回收 GPU 权限，容器资源、宿主运行记录、持久归属记录和 systemd 运行时授权可以保留；管理员必须另行安排权限回收。
 - 如果挂载命名空间、systemd 运行时设备策略、用户映射或 SELinux 无法按本规格安全支持，输出具体阻塞点；不将重启式方案伪装为运行时支持。

@@ -1,14 +1,16 @@
-.TH NVIDIA-NSPAWN 8 "2026-11-17" "nvidia-nspawn 0.1.2" "System Administration"
+.TH NVIDIA-NSPAWN 8 "2026-11-22" "nvidia-nspawn 0.1.3" "System Administration"
 .SH NAME
 nvidia\-nspawn \- inject NVIDIA GPUs into running systemd-nspawn containers
 .SH SYNOPSIS
 .B nvidia\-nspawn plan
 .BI \-\-machine " MACHINE"
 .BI \-\-gpu " GPU_UUID"
+.RB [ \-\-reuse\-empty\-mountpoints ]
 .br
 .B nvidia\-nspawn attach
 .BI \-\-machine " MACHINE"
 .BI \-\-gpu " GPU_UUID"
+.RB [ \-\-reuse\-empty\-mountpoints ]
 .br
 .B nvidia\-nspawn status
 .BI \-\-machine " MACHINE"
@@ -38,6 +40,7 @@ and device policy; print the proposed attachment without applying it.
 Conflicting files, unsafe mount propagation, and unsupported CDI edits are
 rejected.
 After a restart, also preview recovery based on persistent ownership evidence.
+Show the bind targets selected for reuse, if any.
 Do not remove resources or change records.
 .TP
 .B attach
@@ -88,6 +91,19 @@ and
 .BR attach .
 Obtain UUIDs with
 .BR "nvidia-smi -L" .
+.TP
+.B \-\-reuse\-empty\-mountpoints
+Allow reuse of existing empty bind targets for
+.B plan
+and
+.BR attach .
+Unapproved targets are rejected by default.
+The target type must match the source: a zero-byte regular file or a directory
+with no entries.
+The target must not be mounted or contain nested mounts.
+Reuse does not delete targets or change their ownership.
+Device node, symlink, and configuration conflict checks still apply.
+Existing loader configuration reuse is independent of this option (see FILES).
 .TP
 .BI \-\-user " USER"
 Existing non-root user inside the container.
@@ -165,6 +181,16 @@ sudo nvidia-nspawn verify --machine gpu-test --user developer \e
   --cuda-sample /opt/cuda-samples/vectorAdd
 .EE
 .PP
+To approve reuse of existing empty bind targets, review the plan before
+running attach:
+.PP
+.EX
+sudo nvidia-nspawn plan --machine gpu-test --gpu GPU_UUID \e
+  --reuse-empty-mountpoints
+sudo nvidia-nspawn attach --machine gpu-test --gpu GPU_UUID \e
+  --reuse-empty-mountpoints
+.EE
+.PP
 Open this manual or subcommand help:
 .PP
 .EX
@@ -181,6 +207,8 @@ This is runtime state, not a persistent container configuration.
 .I /var/lib/nvidia-nspawn/MACHINE.json
 Persistent rootfs identity and ownership descriptors for resources created by
 new attachments.
+Successful attachments also save the exact approved reuse paths and their
+fingerprints separately from the ownership descriptors.
 Used to validate recovery in a new container instance; this does not persist
 mounts or GPU authorization.
 .TP
@@ -189,8 +217,28 @@ Systemd-managed runtime device authorization on the host.
 It is not a persistent unit edit and may outlive a container restart.
 .TP
 .I /etc/ld.so.conf.d/nvidia-nspawn.conf
-Managed driver library search directories inside the container.
+Driver library search directories inside the container.
 The container's own ldconfig updates its loader cache.
+.IP
+An existing file with no tool ownership record is eligible for automatic reuse
+only if the attachment would generate a loader configuration and the path is a
+regular file, not a symlink, whose contents match the generated configuration
+byte for byte, including the
+.B "# Managed by nvidia-nspawn"
+marker, directory order, and final newline.
+.B plan
+checks eligibility without modifying anything, and
+.B attach
+rechecks before use.
+Reuse requires no option and does not rewrite the file, change its owner,
+record it in the change journal or as a tool-owned resource, or remove it
+during rollback.
+.IP
+If no loader configuration would be generated, or the file type or contents
+do not match, the existing unmanaged file remains a conflict.
+Files already recorded as tool-owned follow the normal recovery rules.
+This exception does not apply to the NVIDIA application profile at
+.IR /etc/nvidia/nvidia\-application\-profiles\-rc.d/10\-container.conf .
 .SH LIFECYCLE AND FAILURES
 Runtime mounts and GPU authorization are not guaranteed to survive container
 or host restarts.
@@ -203,7 +251,11 @@ Unknown files, modified resources, mismatched rootfs identity, or still-mounted
 resources cause cleanup to be refused.
 Neither NVIDIA filenames nor zero length establish ownership or safe removal.
 Residue from older versions without persistent ownership evidence is not
-automatically adopted or migrated; administrators must investigate it.
+automatically adopted or migrated; administrators must investigate remaining
+conflicts.
+An attachment in a new instance can reuse a previously approved target
+without the option only when the rootfs identity and path fingerprint match
+and the target is still empty, with no mount on or below it.
 .PP
 The tool does not start containers or install ExecStartPost hooks or boot-time
 automatic injection.

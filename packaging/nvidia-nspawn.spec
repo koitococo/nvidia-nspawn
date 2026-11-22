@@ -1,5 +1,5 @@
 Name:           nvidia-nspawn
-Version:        0.1.2
+Version:        0.1.3
 Release:        1%{?dist}
 Summary:        Live NVIDIA GPU injection for systemd-nspawn containers
 License:        MIT
@@ -69,6 +69,10 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{__python3} -P -m unittest discover -
 %{_mandir}/man8/nvidia-nspawn.8*
 
 %changelog
+* Sun Nov 22 2026 Koi to Coco <koitococo@outlook.com> - 0.1.3-1
+- Allow explicit reuse of empty bind targets and remember approved mountpoints.
+- Reuse an existing linker configuration only when its contents match exactly.
+
 * Tue Nov 17 2026 Koi to Coco <koitococo@outlook.com> - 0.1.2-1
 - Persist resource ownership and safely reattach after container or host restart.
 - Ignore directory timestamp changes during temporary hook cleanup.

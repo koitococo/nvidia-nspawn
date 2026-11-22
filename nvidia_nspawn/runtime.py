@@ -11,12 +11,13 @@ import tempfile
 
 from . import cdi, host, native_execution
 from .common import Error, require_root, run
-from ._worker import mount_table, parent_mount, recovery_paths, unchanged_path
+from ._worker import (
+    MANAGED_CONF, mount_table, parent_mount, recovery_paths, reusable_mountpoint, unchanged_path,
+)
 
 STATE_DIR = Path("/run/nvidia-nspawn")
 RECOVERY_DIR = Path("/var/lib/nvidia-nspawn")
 WORKER = str(Path(__file__).with_name("_worker.py").resolve())
-MANAGED_CONF = "/etc/ld.so.conf.d/nvidia-nspawn.conf"
 PROFILE = "/etc/nvidia/nvidia-application-profiles-rc.d/10-container.conf"
 
 
@@ -175,29 +176,32 @@ def recovery_path(machine: str) -> Path:
 
 
 def save_recovery(state: dict) -> None:
-    """Persist ownership, including the hidden inodes underneath driver mounts."""
+    """Persist owned resources and non-owning mountpoint approvals separately."""
     current = state["observed"]
     by_path = {entry["path"]: entry for entry in current["paths"]}
     by_path.update(current["tracked_files"])
     by_path.update(state["placeholders"])
     owned = [by_path[path] for path in state["journal"]["created"]
              if path in by_path and by_path[path]["exists"]]
-    record = {"root": state["before"]["root"], "paths": owned}
+    record = {"root": state["before"]["root"], "paths": owned,
+              "reused_mountpoints": state["reused_mountpoints"]}
     RECOVERY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     recovery_path(state["target"]["machine"]).write_text(json.dumps(record, indent=2) + "\n")
 
 
-def plan_recovery(machine: str, target: dict) -> dict:
+def plan_recovery(machine: str, target: dict) -> tuple[dict, dict]:
     path = recovery_path(machine)
     if not path.exists():
-        return {"paths": []}
+        return {"paths": []}, {}
     record = json.loads(path.read_text())
     current = inspect(target, [p["path"] for p in record["paths"]])
     try:
         paths = recovery_paths(record, current)
     except RuntimeError as exc:
         raise Error(str(exc)) from exc
-    return {"root": current["root"], "paths": paths}
+    same_root = all(record["root"][key] == current["root"][key] for key in ("dev", "inode"))
+    approved = record.get("reused_mountpoints", {}) if same_root else {}
+    return {"root": current["root"], "paths": paths}, approved
 
 
 def mapped_id(mapping: str, value: int = 0) -> int:
@@ -226,14 +230,16 @@ def resources(plan: dict) -> list:
     return result
 
 
-def inspect(target: dict, paths: list[str]) -> dict:
-    result = json.loads(worker(target, "inspect", paths=list(dict.fromkeys(paths))))
+def inspect(target: dict, paths: list[str], *, directories: list[str] | None = None,
+            ldconfig_folders: list[str] | None = None) -> dict:
+    result = json.loads(worker(target, "inspect", paths=list(dict.fromkeys(paths)),
+                               directories=directories or [], ldconfig_folders=ldconfig_folders or []))
     result["host_shared_groups"] = sorted({tag for m in mount_table() for tag in m["optional"]
                                            if tag.startswith("shared:")})
     return result
 
 
-def plan(machine: str, gpu: str) -> dict:
+def plan(machine: str, gpu: str, *, reuse_empty_mountpoints: bool = False) -> dict:
     require_root()
     for binary in ("machinectl", "busctl", "nvidia-ctk", "nvidia-smi"):
         if not shutil.which(binary):
@@ -261,23 +267,30 @@ def plan(machine: str, gpu: str) -> dict:
                 raise Error(f"CDI {key} is stale for {device['source']}; regenerate CDI")
     paths = apply_paths(items, edits.get("links", []), True)
     paths += [PROFILE, "/proc/driver/nvidia/params"]
-    observation = inspect(target, paths)
+    directories = [item["target"] for item in items if item["directory"] and not item.get("device")]
+    observation = inspect(target, paths, directories=directories,
+                          ldconfig_folders=edits.get("ldconfig_folders"))
     previous = load_state(machine)
     same_instance = previous and all(previous["target"][k] == target[k]
                                      for k in ("boot_id", "leader", "starttime", "mount_ns"))
     recovery = {"paths": []}
+    reused = {}
+    reused_ldconfig = False
     if same_instance:
         if previous["gpu_uuid"] != gpu:
             raise Error("This container already has another GPU attachment; replacement is unsupported")
         if previous["phase"] != "attached":
             raise Error("Previous attach failed; inspect its reported residual changes before retrying")
+        reused_ldconfig = previous.get("reused_ldconfig", False)
     else:
-        recovery = plan_recovery(machine, target)
+        recovery, approved = plan_recovery(machine, target)
         reclaimed = {entry["path"] for entry in recovery["paths"]}
         validation = {**observation, "paths": [
             {**entry, "exists": False} if entry["path"] in reclaimed else entry
             for entry in observation["paths"]]}
-        validate_destinations(items, edits, validation)
+        reused, reused_ldconfig = validate_destinations(
+            items, edits, validation, approved_mountpoints=approved,
+            reuse_empty_mountpoints=reuse_empty_mountpoints)
     policy = host.device_policy(target["unit"])
     return {"target": target, "gpu_uuid": gpu, "driver_version": host.driver_version(),
             "plan": edits, "resources": items, "before": observation,
@@ -285,6 +298,8 @@ def plan(machine: str, gpu: str) -> dict:
             "requested_device_allow": host.merge_allow(policy["allow"], edits["devices"]),
             "owner": [mapped_id(target["uid_map"]), mapped_id(target["gid_map"])],
             "existing_attachment": bool(same_instance), "recovery": recovery,
+            "reused_mountpoints": reused,
+            "reused_ldconfig": reused_ldconfig,
             "notes": ["Runtime only; restart recovery reclaims only unchanged recorded resources.",
                       "Parent/descendant cgroup filters and SELinux are not bypassed; verify real device opens.",
                       "Device nodes are created with CDI mode and mapped ownership; host DAC is not modified."]}
@@ -294,12 +309,23 @@ def shared_with_host(parent: dict, host_groups: list[str]) -> bool:
     return bool(set(parent["optional"]) & set(host_groups))
 
 
-def validate_destinations(items: list, edits: dict, observation: dict) -> None:
+def validate_destinations(items: list, edits: dict, observation: dict, *,
+                          approved_mountpoints: dict | None = None,
+                          reuse_empty_mountpoints: bool = False) -> tuple[dict, bool]:
     by_path = {p["path"]: p for p in observation["paths"]}
+    approved = approved_mountpoints or {}
+    empty_directories = set(observation.get("empty_directories", ()))
+    reused = {}
     for item in items:
-        info = by_path[item["target"]]
+        path = item["target"]
+        info = by_path[path]
         if info["exists"]:
-            raise Error(f"Refusing to cover existing container resource: {item['target']}")
+            authorized = reuse_empty_mountpoints or unchanged_path(approved.get(path), info)
+            if not authorized or not reusable_mountpoint(
+                item, info, observation["mounts"], empty_directories
+            ):
+                raise Error(f"Refusing to cover existing container resource: {path}")
+            reused[path] = info
         parent = parent_mount(info["resolved"], observation["mounts"])
         if shared_with_host(parent, observation["host_shared_groups"]):
             raise Error(f"Shared mount propagation to host at {parent['target']}; refusing live injection")
@@ -307,9 +333,12 @@ def validate_destinations(items: list, edits: dict, observation: dict) -> None:
         info = by_path[link["link"]]
         if info["exists"] and info.get("link") != link["target"]:
             raise Error(f"CDI symlink would replace a user resource: {link['link']}")
-    for path in (MANAGED_CONF, PROFILE):
-        if by_path[path]["exists"]:
-            raise Error(f"Existing unmanaged NVIDIA configuration conflicts: {path}")
+    reused_ldconfig = by_path[MANAGED_CONF]["exists"]
+    if reused_ldconfig and not observation.get("ldconfig_matches"):
+        raise Error(f"Existing unmanaged NVIDIA configuration conflicts: {MANAGED_CONF}; "
+                    "expected a regular file with the exact generated contents")
+    if by_path[PROFILE]["exists"]:
+        raise Error(f"Existing unmanaged NVIDIA configuration conflicts: {PROFILE}")
     if not observation["ldconfig"] or not observation["setpriv"]:
         raise Error("Container requires ldconfig and setpriv before attach")
     if any("rbind" in item["options"] for item in items) and not observation["recursive_mount_attributes"]:
@@ -317,6 +346,7 @@ def validate_destinations(items: list, edits: dict, observation: dict) -> None:
     for hook in edits["hooks"]:
         if not os.access(hook["path"], os.X_OK):
             raise Error(f"CDI hook executable is missing: {hook['path']}")
+    return reused, reused_ldconfig
 
 
 def apply_hooks(state: dict, stage: str) -> None:
@@ -381,8 +411,8 @@ def observe_changes(state: dict) -> None:
     state["observed"] = current
 
 
-def attach(machine: str, gpu: str) -> dict:
-    prepared = plan(machine, gpu)
+def attach(machine: str, gpu: str, *, reuse_empty_mountpoints: bool = False) -> dict:
+    prepared = plan(machine, gpu, reuse_empty_mountpoints=reuse_empty_mountpoints)
     if prepared["existing_attachment"]:
         current = status(machine)
         if not current["healthy"]:
@@ -399,8 +429,12 @@ def attach(machine: str, gpu: str) -> dict:
         worker(state["target"], "recover", record=state["recovery"])
         state["before"] = inspect(state["target"], apply_paths(
             state["resources"], state["plan"].get("links", []), True)
-            + [PROFILE, "/proc/driver/nvidia/params"])
-        validate_destinations(state["resources"], state["plan"], state["before"])
+            + [PROFILE, "/proc/driver/nvidia/params"],
+            directories=[p for p, info in state["reused_mountpoints"].items()
+                         if stat.S_ISDIR(info["mode"])],
+            ldconfig_folders=state["plan"].get("ldconfig_folders"))
+        validate_destinations(state["resources"], state["plan"], state["before"],
+                              approved_mountpoints=state["reused_mountpoints"])
     save_state(state)
     policy_changed = False
     try:
@@ -413,6 +447,8 @@ def attach(machine: str, gpu: str) -> dict:
         apply_hooks(state, "createRuntime")
         result = json.loads(worker(state["target"], "apply", resources=state["resources"],
                                    links=state["plan"].get("links", []), owner=state["owner"],
+                                   reused_mountpoints=state["reused_mountpoints"],
+                                   reused_ldconfig=state["reused_ldconfig"],
                                    ldconfig_folders=state["plan"].get("ldconfig_folders", [])))
         if "error" in result:
             # The worker already attempted its own rollback.
@@ -507,5 +543,7 @@ def status(machine: str) -> dict:
             "healthy": state["phase"] == "attached" and driver_matches
                        and all(c["present_and_matching"] for c in checks),
             "driver_matches": driver_matches, "resources": checks,
+            "reused_mountpoints": list(state.get("reused_mountpoints", {})),
+            "reused_ldconfig": state.get("reused_ldconfig", False),
             "device_policy": host.device_policy(target["unit"]),
             "note": "Mount/driver health only; use verify for real ordinary-user device access and CUDA execution."}

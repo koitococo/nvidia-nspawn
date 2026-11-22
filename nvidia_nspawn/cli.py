@@ -19,6 +19,8 @@ def main() -> int:
         command.add_argument("--machine", required=True)
         if name in ("plan", "attach"):
             command.add_argument("--gpu", required=True, help="Full GPU UUID (GPU-...)")
+            command.add_argument("--reuse-empty-mountpoints", action="store_true",
+                                 help="Allow reuse of existing empty, unmounted bind targets")
         if name == "verify":
             command.add_argument("--user", required=True, help="Existing non-root container user")
             command.add_argument("--cuda-sample", required=True,
@@ -35,7 +37,8 @@ def main() -> int:
         elif args.command == "status":
             result = runtime.status(args.machine)
         else:
-            result = getattr(runtime, args.command)(args.machine, args.gpu)
+            result = getattr(runtime, args.command)(
+                args.machine, args.gpu, reuse_empty_mountpoints=args.reuse_empty_mountpoints)
         print(json.dumps(result, indent=2))
         return 0
     except (Error, OSError, ValueError, KeyError) as exc:

@@ -91,6 +91,29 @@ sudo python3 -m nvidia_nspawn verify \
 
 同一运行实例、同一 GPU 的成功注入可以重复执行，不叠加挂载。切换 GPU、失败后的残留状态和已有驱动冲突不自动覆盖。
 
+### 复用已有的空挂载点
+
+默认拒绝复用未经批准的已有挂载目标。管理员核实占位路径后，可用 `--reuse-empty-mountpoints`：
+
+```bash
+sudo nvidia-nspawn plan --machine gpu-test --gpu GPU_UUID --reuse-empty-mountpoints
+sudo nvidia-nspawn attach --machine gpu-test --gpu GPU_UUID --reuse-empty-mountpoints
+```
+
+将 `GPU_UUID` 替换为完整的 GPU UUID。先检查 `plan` 输出选中的复用路径；它不会改动容器或保存批准记录。只允许复用类型与绑定挂载源匹配的零字节普通文件或真正为空的目录，且目标本身和其下都不能有挂载。复用不会删除这些路径或更改其所有者。
+
+首次成功注入后，工具在 `/var/lib/nvidia-nspawn/<machine>.json` 中随 rootfs 身份记录批准复用的确切路径和指纹，与工具创建资源的归属记录分开。容器重新运行后，普通 `attach` 无须再次加该选项，但只会复用同一 rootfs 中指纹未变、仍为空且未挂载的已批准目标。
+
+该选项不会绕过设备节点、符号链接或配置冲突检查。
+
+### 复用已有的动态链接器配置
+
+`plan` 只读检查容器中已有、没有工具归属记录的 `/etc/ld.so.conf.d/nvidia-nspawn.conf`。只有本次需要生成配置，且目标是普通文件而非符号链接、内容与将要生成的配置逐字节相同时，`attach` 才会自动复用。比较包含 `# Managed by nvidia-nspawn` 标记、库目录顺序和末尾换行。`attach` 在使用前重新检查；复用不改写文件、不改变所有者、不写入变更日志或工具资源归属记录，失败时也不会删除它。
+
+此行为不需要 `--reuse-empty-mountpoints` 或其他选项。如果没有要生成的配置，或已有文件的类型或内容不匹配，仍报冲突，由管理员单独核实。已有工具归属记录的文件仍按下文的恢复流程处理。此规则不适用于 `/etc/nvidia/nvidia-application-profiles-rc.d/10-container.conf`；已有的 NVIDIA 应用配置仍按原规则检查冲突。
+
+如果确认 `10-container.conf` 是旧版注入留下的 Toolkit 生成文件，可先将它备份移出 NVIDIA 配置目录，再重新注入。让 Toolkit 根据当前设备重新生成配置，不要直接沿用旧 GPU 可见性掩码。
+
 ### verify
 
 以指定普通用户执行：
@@ -111,7 +134,7 @@ sudo python3 -m nvidia_nspawn verify \
 - 不配置 `ExecStartPost` 或开机自动注入，也不自动启动容器或永久修改 nspawn unit。容器或宿主机重启后，管理员需在容器已运行时手工执行 `plan` 和 `attach`。
 - `DeviceAllow` 通过 `runtime=true` 更新，systemd 在 `/run/systemd/system.control/` 下记录运行时 drop-in。容器重启不保证撤销这份授权；宿主机重启后该运行时配置不持久保留。
 - 运行时挂载和 GPU 授权不承诺跨重启保留，容器文件系统上的配置和占位文件可能保留。新运行实例的 `attach` 根据持久归属记录验证 rootfs 身份与资源指纹，只回收仍未修改且未挂载的旧工具资源，再重新注入；`plan` 仅预览，不执行回收。
-- 未知文件、已修改资源、rootfs 身份不匹配或仍挂载的资源均拒绝清理，不凭 NVIDIA 文件名或零字节大小认定可删。旧版未留下持久归属证据的残留不自动认领或迁移，需管理员核实处理。
+- 未知文件、已修改资源、rootfs 身份不匹配或仍挂载的资源均拒绝清理，不凭 NVIDIA 文件名或零字节大小认定可删。旧版未留下持久归属证据的残留不自动认领或迁移；仍存在的冲突需管理员核实处理。
 - 驱动升级不做热更新，旧驱动版本记录会导致健康检查或验证失败。
 - 失败时尝试撤销本次创建的挂载、节点、配置和设备授权，保留失败 journal；不删除原先已有的用户文件。
 - 外部命令超时后，先终止并回收受监督的工作进程及后代，再开始失败清理；逐条记录已完成的挂载和文件变更。内核不可中断睡眠可能延长回收等待，超时不是保证立即返回。中断发生在文件操作与日志写入之间时，只报告无法确认的残留候选，不盲删既有资源，也不声称原子回滚。
@@ -189,16 +212,16 @@ sudo zypper install rpm-build python-rpm-macros python3-devel \
 ```bash
 python3 -c 'from setuptools.build_meta import build_sdist; build_sdist("dist")'
 mkdir -p ~/rpmbuild/SOURCES
-cp dist/nvidia_nspawn-0.1.2.tar.gz ~/rpmbuild/SOURCES/
+cp dist/nvidia_nspawn-0.1.3.tar.gz ~/rpmbuild/SOURCES/
 rpmbuild -ba packaging/nvidia-nspawn.spec
 ```
 
 二进制包在 `~/rpmbuild/RPMS/noarch/`，源码 RPM 在 `~/rpmbuild/SRPMS/`。`%check` 对构建根目录中的 Python 包运行算法测试，不需要 GPU。
 
 ```bash
-# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.2-1.lp160.noarch.rpm
+# 示例：Fedora 45；Leap 16.0 对应文件名为 nvidia-nspawn-0.1.3-1.lp160.noarch.rpm
 # --nosignature 仅用于自己构建的未签名包，不跳过摘要或依赖检查
-sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.2-1.fc45.noarch.rpm
+sudo rpm -Uvh --nosignature ~/rpmbuild/RPMS/noarch/nvidia-nspawn-0.1.3-1.fc45.noarch.rpm
 nvidia-nspawn --help
 ```
 
@@ -248,7 +271,7 @@ sudo rpm -Uvh ./对应发行版的签名包.noarch.rpm
 
 ## GitHub Release 自动发布
 
-`.github/workflows/release.yml` 在推送 `v*` tag 时运行。正式发布 tag 必须是 `vX.Y.Z`，并且与 `pyproject.toml` 和 RPM spec 的 `Version` 完全一致；不匹配的 tag 会构建失败，不会发布。当前版本对应 `v0.1.2`。
+`.github/workflows/release.yml` 在推送 `v*` tag 时运行。正式发布 tag 必须是 `vX.Y.Z`，并且与 `pyproject.toml` 和 RPM spec 的 `Version` 完全一致；不匹配的 tag 会构建失败，不会发布。当前版本对应 `v0.1.3`。
 
 工作流在 Fedora 45、openSUSE Leap 16.0 的官方容器中分别安装原生构建依赖并执行 `packaging/build-rpm.sh`，运行 RPM `%check`。两版全部成功后，才使用仓库自带的 `GITHUB_TOKEN` 创建 Release 并上传：
 
@@ -264,8 +287,8 @@ sudo rpm -Uvh ./对应发行版的签名包.noarch.rpm
 发布前先提交并推送 workflow 和对应版本的源码，再创建、推送 tag，例如：
 
 ```bash
-git tag -a v0.1.2 -m "Release v0.1.2"
-git push origin v0.1.2
+git tag -a v0.1.3 -m "Release v0.1.3"
+git push origin v0.1.3
 ```
 
 不要把示例 tag 推到缺少 workflow 的旧提交。已有 tag 不会因为后来添加 workflow 自动补跑；已有 Release 也不会被自动覆盖。版本升级时同步更新 `pyproject.toml`、RPM spec 的版本和 man page 中的版本说明；同版本 RPM 修订的本地重建不等同于新的 `vX.Y.Z` 发布。
@@ -273,9 +296,9 @@ git push origin v0.1.2
 在匹配发行版上安装前述构建依赖后，也可运行同一构建脚本：
 
 ```bash
-TAG_NAME=v0.1.2 bash packaging/build-rpm.sh fedora45 dist/release
+TAG_NAME=v0.1.3 bash packaging/build-rpm.sh fedora45 dist/release
 # openSUSE Leap 16.0:
-TAG_NAME=v0.1.2 bash packaging/build-rpm.sh opensuse-leap16 dist/release
+TAG_NAME=v0.1.3 bash packaging/build-rpm.sh opensuse-leap16 dist/release
 ```
 
 ## 本地检查

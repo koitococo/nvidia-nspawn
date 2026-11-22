@@ -4,6 +4,7 @@ Detached host mount trees and hook FDs are acquired before setns/chroot.
 A PID-namespace child gives hooks a valid container-relative /proc view.
 """
 
+from collections.abc import Collection
 import ctypes
 import errno
 import json
@@ -20,6 +21,7 @@ LIBC.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
 LIBC.setns.argtypes = [ctypes.c_int, ctypes.c_int]
 
 JOURNAL_FD = None
+MANAGED_CONF = "/etc/ld.so.conf.d/nvidia-nspawn.conf"
 
 
 def validate_user_namespace(own_namespace: str, target_namespace: str,
@@ -124,6 +126,11 @@ def parent_mount(path: str, mounts: list) -> dict:
     return max(candidates, key=lambda m: len(m["target"]))
 
 
+def _mounted_at_or_below(path: str, mounts: list) -> bool:
+    prefix = path.rstrip("/") + "/"
+    return any(m["target"] == path or m["target"].startswith(prefix) for m in mounts)
+
+
 def describe(path: str) -> dict:
     result = {"path": path, "resolved": os.path.realpath(path), "exists": os.path.lexists(path)}
     if result["exists"]:
@@ -145,6 +152,32 @@ def unchanged_path(saved: dict | None, actual: dict | None) -> bool:
             == {k: v for k, v in actual.items() if k not in ignored})
 
 
+def _empty_directory(path: str) -> bool:
+    try:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            return False
+        with os.scandir(path) as entries:
+            return next(entries, None) is None
+    except OSError:
+        return False
+
+
+def reusable_mountpoint(item: dict, info: dict, mounts: list,
+                        empty_directories: Collection[str]) -> bool:
+    """Check whether a pre-existing target is safe to borrow without owning it."""
+    if item.get("device") or not info["exists"]:
+        return False
+    directory = item["directory"]
+    expected_type = stat.S_IFDIR if directory else stat.S_IFREG
+    if stat.S_IFMT(info["mode"]) != expected_type:
+        return False
+    source_mode = item.get("fingerprint", {}).get("mode")
+    if source_mode is not None and stat.S_IFMT(source_mode) != expected_type:
+        return False
+    empty = info["path"] in empty_directories if directory else info["size"] == 0
+    return empty and not _mounted_at_or_below(info["resolved"], mounts)
+
+
 def recovery_paths(record: dict, current: dict) -> list[dict]:
     """Select only unchanged owned resources in the same container rootfs."""
     if any(record["root"][key] != current["root"][key] for key in ("dev", "inode")):
@@ -157,9 +190,7 @@ def recovery_paths(record: dict, current: dict) -> list[dict]:
             continue
         if not unchanged_path(saved, actual):
             raise RuntimeError(f"Managed resource changed; refusing recovery: {saved['path']}")
-        resolved = actual["resolved"]
-        if any(m["target"] == resolved or m["target"].startswith(resolved.rstrip("/") + "/")
-               for m in current["mounts"]):
+        if _mounted_at_or_below(actual["resolved"], current["mounts"]):
             raise RuntimeError(f"Managed resource is mounted; refusing recovery: {saved['path']}")
         result.append(actual)
     return result
@@ -231,38 +262,72 @@ def cleanup(journal: dict) -> list:
     return errors
 
 
+def _ldconfig_contents(folders: list[str]) -> bytes | None:
+    if not folders:
+        return None
+    return ("# Managed by nvidia-nspawn\n" + "\n".join(folders) + "\n").encode("utf-8")
+
+
+def _ldconfig_matches(expected: bytes | None) -> bool:
+    if expected is None:
+        return False
+    try:
+        if not stat.S_ISREG(os.lstat(MANAGED_CONF).st_mode):
+            return False
+        fd = os.open(MANAGED_CONF, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            return (stat.S_ISREG(os.fstat(fd).st_mode)
+                    and stream.read(len(expected) + 1) == expected)
+    except OSError:
+        return False
+
+
 def apply(request: dict, fds: list[int]) -> dict:
     journal = {"mounted": [], "created": []}
     placeholders = {}
     owner = request["owner"]
+    reused_mountpoints = request.get("reused_mountpoints", {})
     try:
         for item, fd in zip(request["resources"], fds):
             path = item["target"]
-            make_parents(path, journal, owner)
             if item.get("device"):
+                make_parents(path, journal, owner)
                 os.mknod(path, stat.S_IFCHR | item["node_mode"], item["rdev"])
                 record_change(journal, "created", path)
                 os.chown(path, *item["node_owner"])
                 os.chmod(path, item["node_mode"])
                 continue
-            if not os.path.lexists(path):
-                if item["directory"]:
-                    os.mkdir(path, 0o755)
-                else:
-                    with open(path, "xb"):
-                        pass
-                record_change(journal, "created", path)
-                os.chown(path, *owner)
-            placeholders[path] = describe(path)
-            options = item.get("options", [])
+            approved = reused_mountpoints.get(path)
             # Recursive security attributes were already set on the detached tree.
             # A /proc/self/fd path to a host mount cannot be bind-mounted from
             # another mount namespace. Transfer a detached host mount instead.
             LIBC.move_mount.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
                                        ctypes.c_char_p, ctypes.c_uint]
+            if approved is None:
+                make_parents(path, journal, owner)
+                try:
+                    if item["directory"]:
+                        os.mkdir(path, 0o755)
+                    else:
+                        with open(path, "xb"):
+                            pass
+                except FileExistsError as exc:
+                    raise RuntimeError(
+                        f"Refusing to cover existing container resource: {path}") from exc
+                record_change(journal, "created", path)
+                os.chown(path, *owner)
+                placeholders[path] = describe(path)
+            else:
+                actual = describe(path)
+                if not unchanged_path(approved, actual) or not reusable_mountpoint(
+                    item, actual, mount_table(),
+                    (path,) if item["directory"] and _empty_directory(path) else (),
+                ):
+                    raise RuntimeError(f"Approved mountpoint changed or is no longer reusable: {path}")
             syscall(LIBC.move_mount(fd, b"", -100, os.fsencode(path), 4),
                     f"attach detached host mount to {path}")
             record_change(journal, "mounted", path)
+            options = item.get("options", [])
             flags = 4096 | 32 | 1  # MS_BIND | MS_REMOUNT | MS_RDONLY
             for option, bit in (("ro", 1), ("nosuid", 2), ("nodev", 4), ("noexec", 8),
                                 ("sync", 16), ("dirsync", 128), ("noatime", 1024),
@@ -281,13 +346,16 @@ def apply(request: dict, fds: list[int]) -> dict:
             os.symlink(link["target"], path)
             record_change(journal, "created", path)
             os.chown(path, *owner, follow_symlinks=False)
-        if request["ldconfig_folders"]:
-            path = "/etc/ld.so.conf.d/nvidia-nspawn.conf"
-            make_parents(path, journal, owner)
-            with open(path, "x") as stream:
-                record_change(journal, "created", path)
-                stream.write("# Managed by nvidia-nspawn\n" + "\n".join(request["ldconfig_folders"]) + "\n")
-            os.chown(path, *owner)
+        expected = _ldconfig_contents(request["ldconfig_folders"])
+        if request.get("reused_ldconfig", False):
+            if not _ldconfig_matches(expected):
+                raise RuntimeError(f"Reused ldconfig configuration is missing or changed: {MANAGED_CONF}")
+        elif expected is not None:
+            make_parents(MANAGED_CONF, journal, owner)
+            with open(MANAGED_CONF, "xb") as stream:
+                record_change(journal, "created", MANAGED_CONF)
+                stream.write(expected)
+            os.chown(MANAGED_CONF, *owner)
         return {"journal": journal, "placeholders": placeholders}
     except Exception as exc:
         return {"error": str(exc), "journal": journal, "cleanup_errors": cleanup(journal)}
@@ -299,7 +367,11 @@ def dispatch(request: dict, fds: list[int]) -> dict:
         table = mount_table()
         return {"root": describe("/"), "mounts": table,
                 "paths": [describe(p) for p in request["paths"]],
+                "empty_directories": [p for p in request.get("directories", [])
+                                      if _empty_directory(p)],
                 "tracked_files": tracked_files(),
+                "ldconfig_matches": _ldconfig_matches(_ldconfig_contents(
+                    request.get("ldconfig_folders", []))),
                 "ldconfig": next((p for p in ("/sbin/ldconfig", "/usr/sbin/ldconfig")
                                   if os.access(p, os.X_OK)), None),
                 "setpriv": next((p for p in ("/usr/bin/setpriv", "/bin/setpriv")
